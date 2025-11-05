@@ -1,0 +1,10 @@
+[package]
+edition = "2024"
+links = "gdrapi"
+name = "gdrapi-sys"
+publish = false
+
+[build-dependencies]
+build-utils = { workspace = true }
+
+bindgen = {workspace = true}

@@ -1,0 +1,34 @@
+[package]
+edition = "2024"
+name = "fabric-lib"
+publish = false
+
+[features]
+default = []
+tokio = ["dep:tokio", "tokio/sync", "tokio/rt-multi-thread"]
+
+[dependencies]
+libfabric-sys = { path = "./libfabric-sys" }
+libibverbs-sys = { path = "./libibverbs-sys" }
+
+cuda-lib = { workspace = true }
+thread-lib = { workspace = true }
+
+anyhow = { workspace = true }
+bytes = { workspace = true }
+crossbeam-channel = { workspace = true }
+dashmap = { workspace = true }
+libc = { workspace = true }
+once_cell = { workspace = true }
+oneshot = { workspace = true }
+parking_lot = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+syscalls = { workspace = true }
+mockall = { workspace = true }
+
+# Optional dependencies
+tokio = { workspace = true, optional = true }

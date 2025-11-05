@@ -1,0 +1,14 @@
+[package]
+edition = "2024"
+links = "torch-lib"
+name = "torch-lib"
+publish = false
+
+[dependencies]
+cxx = { workspace = true }
+pyo3 = { workspace = true }
+cuda-lib = { workspace = true }
+
+[build-dependencies]
+cxx-build = { workspace = true }
+pkg-config = { workspace = true }

@@ -1,0 +1,23 @@
+[package]
+edition = "2024"
+name = "pplx-garden-python-ext"
+
+[lib]
+name = "pplx_garden_python_ext"
+crate-type = ["cdylib"]
+
+[dependencies]
+cuda-lib = { workspace = true }
+fabric-lib = { workspace = true }
+logging-lib = { workspace = true }
+thread-lib = { workspace = true }
+torch-lib = { workspace = true }
+p2p-all-to-all = { workspace = true }
+
+bincode = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+postcard = { workspace = true }
+pyo3 = { workspace = true, features = ["extension-module", "abi3-py310"] }
+serde = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,10 @@
+[package]
+edition = "2024"
+links = "cudart"
+name = "cudart-sys"
+publish = false
+
+[build-dependencies]
+build-utils = { workspace = true }
+
+bindgen = {workspace = true}

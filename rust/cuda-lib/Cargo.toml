@@ -1,0 +1,16 @@
+[package]
+edition = "2024"
+name = "cuda-lib"
+publish = false
+
+[dependencies]
+cuda-sys = { path = "./cuda-sys" }
+cudart-sys = { path = "./cudart-sys" }
+gdrapi-sys = { path = "./gdrapi-sys" }
+
+libc = { workspace = true }
+thiserror = { workspace = true }
+bincode = { workspace = true, features = ["derive", "alloc"] }
+
+[dev-dependencies]
+proc-lib.workspace = true

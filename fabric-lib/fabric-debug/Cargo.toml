@@ -1,0 +1,14 @@
+[package]
+edition = "2024"
+name = "fabric-debug"
+publish = false
+
+[dependencies]
+fabric-lib = { workspace = true }
+cuda-lib = { workspace = true }
+logging-lib = { workspace = true, features=[] }
+
+anyhow = { workspace = true }
+bytes = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }

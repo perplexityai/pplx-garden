@@ -1,0 +1,11 @@
+[package]
+edition = "2024"
+links = "ibverbs"
+name = "libibverbs-sys"
+publish = false
+
+[build-dependencies]
+build-utils = { workspace = true }
+
+bindgen = { workspace = true }
+cc = { workspace = true }

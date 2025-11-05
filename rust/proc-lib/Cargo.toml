@@ -1,0 +1,12 @@
+[package]
+name = "proc-lib"
+edition = "2024"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+quote = "1.0"
+proc-macro2 = "1.0"
+
+cudart-sys = { path = "../cuda-lib/cudart-sys" }

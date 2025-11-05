@@ -1,0 +1,4 @@
+[package]
+edition = "2024"
+name = "build-utils"
+publish = false

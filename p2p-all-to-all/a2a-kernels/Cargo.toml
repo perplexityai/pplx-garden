@@ -1,0 +1,14 @@
+[package]
+edition = "2024"
+links = "a2a_kernels"
+name = "a2a-kernels"
+publish = false
+
+[dependencies]
+cxx = { workspace = true }
+torch-lib = { workspace = true }
+
+[build-dependencies]
+cc = {workspace = true, features = ["parallel"]}
+cxx-build = { workspace = true }
+build-utils = {workspace = true}

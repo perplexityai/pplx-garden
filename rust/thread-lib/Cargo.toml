@@ -1,0 +1,7 @@
+[package]
+edition = "2024"
+name = "thread-lib"
+
+[dependencies]
+libc = { workspace = true }
+syscalls = { workspace = true }

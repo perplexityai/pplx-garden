@@ -1,0 +1,12 @@
+[package]
+edition = "2024"
+name = "logging-lib"
+
+[dependencies]
+anyhow = { workspace = true }
+is-terminal = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-core = { workspace = true }
+tracing-log = { workspace = true }
+tracing-subscriber = { workspace = true }

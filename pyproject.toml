@@ -1,0 +1,112 @@
+[build-system]
+requires = ["setuptools>=80", "setuptools-rust>=1.12", "setuptools-scm>=9"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pplx_garden"
+description = "Perplexity AI open source garden"
+authors = [
+    { name = "Lequn Chen", email = "lequn@perplexity.ai" },
+    { name = "Nandor Licker", email = "nandor@perplexity.ai" },
+]
+dynamic = ["version"]
+dependencies = ["numpy"]
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[[tool.setuptools-rust.ext-modules]]
+target = "pplx_garden._rust"
+path = "python-ext/Cargo.toml"
+binding = "PyO3"
+
+[tool.setuptools_scm]
+version_file = "python/pplx_garden/_version.py"
+
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+known-first-party = ["pplx_garden", "tests", "benchmarks"]
+
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "W",    # pycodestyle warnings
+    "F",    # Pyflakes
+    "UP",   # pyupgrade
+    "I",    # isort
+    "SIM",  # flake8-simplify
+    "C4",   # flake8-comprehensions
+    "PT",   # flake8-pytest
+    "PIE",  # flake8-pie
+    "EXE",  # flake8-executable
+    "A",    # flake8-builtins
+    "B",    # flake8-bugbear
+    "ANN",  # flake8-annotations
+    "BLE",  # flake8-blind-except
+    "LOG",  # flake8-logging
+    "G",    # flake8-logging-format
+    "TCH",  # flake8-type-checking
+    "RSE",  # flake8-raise
+    "RET",  # flake8-return
+    "T20",  # flake8-print
+    "ICN",  # flake8-import-conventions
+    "TID",  # flake8-tidy-imports
+    "INP",  # flake8-no-pep420
+    "NPY",  # numpy
+    "FURB", # refurb
+    "TRY",  # tryceratops
+    "FLY",  # flynt,
+]
+ignore = [
+    "E501",   # Line too long
+    "ANN401", # Allow Any
+    "TRY003", # Allow long messages
+    "SIM117", # Allow nested with
+    "TC006",  # Add quotes to type expression in cast()
+    "C420",   # Unnecessary dict comprehension for iterable; use `dict.fromkeys` instead
+    "A005",   # Shadowing builtins
+    "UP045",  # Use `X | None` for type annotations
+    "B905",   # `zip()` without an explicit `strict=` parameter
+]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
+log_cli = true
+log_cli_format = "[%(asctime)s.%(msecs)03d] %(process)d %(levelname)-8s %(name)s %(message)s"
+log_cli_level = "DEBUG"
+log_date_format = "%Y-%m-%d %H:%M:%S"
+markers = [
+    "ci_2gpu: marks to run on p5-2gpu runner (To run on p5-1gpu runner, use -m 'not (ci_2gpu or ci_4gpu)')",
+    "ci_4gpu: marks to run on p5-4gpu runner (To run on p5-1gpu runner, use -m 'not (ci_2gpu or ci_4gpu)')",
+    "cpu_only: marks tests which do not use a GPU",
+    "fabric: marks tests which require libfabric",
+    "kernel: marks kernel tests (deselect with -m 'not kernel')",
+]
+
+[tool.coverage.run]
+branch = true
+omit = ["tests/**/*"]
+concurrency = ["multiprocessing", "thread"]
+parallel = true
+
+[tool.coverage.report]
+exclude_also = [
+    # Don't complain about missing debug-only code:
+    "def __repr__",
+
+    # Don't complain if tests don't hit defensive assertion code:
+    "raise AssertionError",
+    "raise NotImplementedError",
+
+    # Don't complain if non-runnable code isn't run:
+    "if 0:",
+    "if __name__ == .__main__.:",
+
+    # Don't complain about abstract methods, they aren't run:
+    "@(abc\\.)?abstractmethod",
+]

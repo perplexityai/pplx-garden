@@ -1,0 +1,15 @@
+[package]
+edition = "2024"
+name = "p2p-all-to-all"
+
+[dependencies]
+a2a-kernels = { path = "a2a-kernels" }
+cuda-lib = { workspace = true }
+fabric-lib = { workspace = true }
+thread-lib = { workspace = true }
+torch-lib = { workspace = true }
+
+anyhow = { workspace = true }
+nvtx = { workspace = true }
+oneshot = { workspace = true }
+tracing = { workspace = true }
