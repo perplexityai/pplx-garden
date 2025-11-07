@@ -23,6 +23,7 @@ use libibverbs_sys::{
     ibv_send_wr, ibv_sge, ibv_srq, ibv_srq_attr, ibv_srq_init_attr, ibv_td,
     ibv_td_init_attr, ibv_wc, ibv_wc_status_str,
 };
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, warn};
 
@@ -57,6 +58,7 @@ pub struct VerbsDomain {
     name: String,
     port_num: u8,
     gid_index: u8,
+    pkey_index: u16,
 
     context: NonNull<ibv_context>,
     lid: u16,
@@ -72,8 +74,6 @@ pub struct VerbsDomain {
     msg_srq: NonNull<ibv_srq>,
     rma_srq: NonNull<ibv_srq>,
 
-    // TODO: av_map
-    // TODO: peer_qp_map
     ud: UDQueuePair,
     addr: DomainAddress,
     peers: HashMap<DomainAddress, Peer>,
@@ -211,7 +211,6 @@ impl VerbsDomain {
                 return Err(VerbsError::with_code(errno, "ibv_query_gid").into());
             }
             let gid = Gid { raw: gid.raw };
-            // TODO: p_key partition key
 
             // Thread domain to remove locks now that we are single-threaded.
             let mut td_init_attr = ibv_td_init_attr { comp_mask: 0 };
@@ -281,12 +280,12 @@ impl VerbsDomain {
             });
 
             // Create UD QP for exchanging RC handshake info.
-            let qkey = 0x11111111; // TODO: randomize qkey
+            // qkey >= 0x80000000 is "Privileged Q_Keys".
+            let qkey = rand::rng().next_u32() & 0x7FFFFFFF;
             let ud = UDQueuePair::new(cq, pd, gid, lid, qkey, MAX_OPS as u32)?;
 
             // Activate UD QP
-            let pkey_index = 0; // TODO: get pkey_index
-            ud.ud_reset_to_init(pkey_index, info.port_num)?;
+            ud.ud_reset_to_init(info.pkey_index, info.port_num)?;
             ud.ud_init_to_rtr()?;
             ud.ud_rtr_to_rts()?;
             let addr = DomainAddress::from(&ud.addr);
@@ -306,6 +305,7 @@ impl VerbsDomain {
                 name,
                 port_num: info.port_num,
                 gid_index: info.gid_index,
+                pkey_index: info.pkey_index,
 
                 context,
                 lid,
@@ -451,8 +451,10 @@ impl VerbsDomain {
             .ok_or(FabricLibError::Custom("Invalid peer address"))?;
 
         // Create QP
-        let msg_psn = 123; // TODO: randomize psn
-        let rma_psn = 456; // TODO: randomize psn
+        // Use fixed PSN to simplify the handshake process, especially when
+        // both sides are trying to connect to each other at the same time.
+        let msg_psn = 123;
+        let rma_psn = 456;
         let msg_rc = RCQueuePair::new(
             self.cq,
             self.pd,
@@ -539,9 +541,8 @@ impl VerbsDomain {
 
         // Activate QP
 
-        let pkey_index = 0; // TODO: get pkey_index
-        peer.msg_rc.rc_reset_to_init(self.port_num, pkey_index)?;
-        peer.rma_rc.rc_reset_to_init(self.port_num, pkey_index)?;
+        peer.msg_rc.rc_reset_to_init(self.port_num, self.pkey_index)?;
+        peer.rma_rc.rc_reset_to_init(self.port_num, self.pkey_index)?;
 
         peer.msg_rc.rc_init_to_rtr(
             self.is_infiniband,
@@ -628,7 +629,6 @@ impl VerbsDomain {
         region: &MemoryRegion,
         allow_remote: bool,
     ) -> Result<MemoryRegionRemoteKey> {
-        // TODO: new type for rkey
         if let Some(mr) = self.local_mr_map.get(&region.ptr()) {
             return Ok(MemoryRegionRemoteKey(unsafe { mr.as_ref() }.rkey as u64));
         }
@@ -1340,7 +1340,6 @@ impl RdmaDomain for VerbsDomain {
 impl Drop for VerbsDomain {
     fn drop(&mut self) {
         debug!(name = self.name, "VerbsDomain::drop");
-        // TODO: drop only_qp and ud
         unsafe {
             for (_, mr) in self.local_mr_map.drain() {
                 ibv_dereg_mr(mr.as_ptr());

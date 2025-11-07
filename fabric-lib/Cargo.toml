@@ -19,16 +19,17 @@ bytes = { workspace = true }
 crossbeam-channel = { workspace = true }
 dashmap = { workspace = true }
 libc = { workspace = true }
+mockall = { workspace = true }
 once_cell = { workspace = true }
 oneshot = { workspace = true }
 parking_lot = { workspace = true }
 postcard = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 smallvec = { workspace = true }
+syscalls = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-syscalls = { workspace = true }
-mockall = { workspace = true }
 
 # Optional dependencies
 tokio = { workspace = true, optional = true }

@@ -39,13 +39,13 @@ pub struct VerbsDeviceInfo {
     pub device_index: usize,
     pub port_num: u8,
     pub gid_index: u8,
+    pub pkey_index: u16,
 }
 
 impl VerbsDeviceInfo {
     pub fn new(device_list: Arc<VerbsDeviceList>, device_index: usize) -> Self {
-        // TODO: port_num
-        // TODO: gid_index
-        Self { device_list, device_index, port_num: 1, gid_index: 0 }
+        // TODO: Support non-default port gid_index, and pkey_index if there's a need.
+        Self { device_list, device_index, port_num: 1, gid_index: 0, pkey_index: 0 }
     }
 
     pub fn device(&self) -> *mut ibv_device {

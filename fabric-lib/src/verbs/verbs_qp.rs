@@ -104,7 +104,6 @@ impl UDQueuePair {
 }
 
 pub struct RCQueuePair {
-    // TODO: state enum
     pub addr: VerbsRCAddress,
     pub qp: NonNull<ibv_qp>,
 }
