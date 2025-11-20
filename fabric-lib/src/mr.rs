@@ -3,6 +3,7 @@ use std::{ffi::c_void, ptr::NonNull};
 use cuda_lib::driver::cu_get_dma_buf_fd;
 use cuda_lib::rt::{cudaMemoryTypeDevice, cudaPointerGetAttributes};
 use cuda_lib::{CudaDeviceId, Device};
+use once_cell::sync::Lazy;
 
 use crate::error::{FabricLibError, Result};
 
@@ -28,7 +29,11 @@ impl MemoryRegion {
                 if attrs.type_ != cudaMemoryTypeDevice {
                     return Err(FabricLibError::Custom("not a device pointer"));
                 }
-                let dmabuf_fd = cu_get_dma_buf_fd(ptr, len).ok();
+                let dmabuf_fd = if linux_kernel_supports_dma_buf() {
+                    cu_get_dma_buf_fd(ptr, len).ok()
+                } else {
+                    None
+                };
                 Mapping::Device { device_id, dmabuf_fd }
             }
         };
@@ -66,3 +71,18 @@ impl Drop for MemoryRegion {
 #[derive(Debug, Clone, Copy)]
 #[repr(transparent)]
 pub struct MemoryRegionLocalDescriptor(pub u64);
+
+static LINUX_KERNEL_SUPPORTS_DMA_BUF: Lazy<bool> = Lazy::new(|| {
+    let Ok(version) = std::fs::read_to_string("/proc/sys/kernel/osrelease") else {
+        return false;
+    };
+    let mut parts = version.split('.');
+    let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    (major, minor) >= (5, 12)
+});
+
+fn linux_kernel_supports_dma_buf() -> bool {
+    *LINUX_KERNEL_SUPPORTS_DMA_BUF
+}
