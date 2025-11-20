@@ -24,14 +24,13 @@ Perplexity AI open source garden for inference technology
 
 # System requirements
 
-* Linux Kernel 5.15 or higher
-* (Recommended) Linux Kernel 6.1 or higher (for DMA-BUF support)
+* (Recommended) Linux Kernel 5.12 or higher (for DMA-BUF support)
 * CUDA 12.8 or higher
 * libfabric
 * libibverbs
 * GDRCopy
 * `SYS_PTRACE` and `SYS_ADMIN` Linux capabilities for `pidfd_getfd`. You can obtain these by running as root, with sudo, or inside docker with `--cap-add=SYS_PTRACE --cap-add=SYS_ADMIN`.
-* RDMA network with GPUDirect RDMA support
+* RDMA network with GPUDirect RDMA support. Each GPU should have at least one dedicated RDMA NIC.
 
 # Docker dev image
 
