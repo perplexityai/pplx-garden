@@ -47,7 +47,7 @@ pub fn cudaPointerGetAttributes(
 pub use cudart_sys::cudaDeviceProp;
 pub fn cudaGetDeviceProperties(device: i32) -> CudaResult<cudaDeviceProp> {
     let mut prop = cudaDeviceProp::default();
-    let ret = unsafe { cudart_sys::cudaGetDeviceProperties_v2(&raw mut prop, device) };
+    let ret = unsafe { cudart_sys::cudaGetDeviceProperties(&raw mut prop, device) };
     match ret {
         0 => Ok(prop),
         _ => Err(CudartError::new(ret, "cudaGetDeviceProperties")),

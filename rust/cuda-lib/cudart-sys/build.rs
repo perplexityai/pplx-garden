@@ -1,13 +1,29 @@
+use bindgen::callbacks::{ItemInfo, ParseCallbacks};
+use build_utils::find_package;
 use std::{env, path::PathBuf};
 
-use build_utils::find_package;
+#[derive(Debug)]
+struct RenameCallback;
+
+impl ParseCallbacks for RenameCallback {
+    fn item_name(&self, item_info: ItemInfo) -> Option<String> {
+        match item_info.name {
+            // CUDA 12 defines cudaGetDeviceProperties as cudaGetDeviceProperties_v2.
+            // CUDA 13 dropped the _v2 suffix.
+            "cudaGetDeviceProperties_v2" => Some("cudaGetDeviceProperties".into()),
+
+            // No rename needed.
+            _ => None,
+        }
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cuda_home = find_package("CUDA_HOME", &["/usr/local/cuda"], "include/cuda.h");
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
         .clang_arg(format!("-I{}/include", cuda_home.display()))
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .parse_callbacks(Box::new(RenameCallback))
         .prepend_enum_name(false)
         .allowlist_item(r"cuda.*")
         .derive_default(true)
