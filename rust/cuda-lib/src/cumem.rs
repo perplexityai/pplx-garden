@@ -179,6 +179,8 @@ impl CUMemAllocHandle {
             CUMemHandleKind::Fabric => cuda_sys::CU_MEM_HANDLE_TYPE_FABRIC,
         };
 
+        props.allocFlags.gpuDirectRDMACapable = 1;
+
         let mut granularity: usize = 0;
         cuda_check!(cuda_sys::cuMemGetAllocationGranularity(
             &mut granularity,
