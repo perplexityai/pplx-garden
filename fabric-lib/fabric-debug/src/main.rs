@@ -19,8 +19,9 @@ use cuda_lib::{
 use fabric_lib::{
     FabricEngine, RdmaDomainInfo, Worker,
     api::{
-        DomainAddress, DomainGroupRouting, ImmTransferRequest, MemoryRegionDescriptor,
-        MemoryRegionHandle, PagedTransferRequest, SingleTransferRequest,
+        DomainAddress, DomainGroupRouting, GroupTransferRouting, ImmTransferRequest,
+        MemoryRegionDescriptor, MemoryRegionHandle, PagedTransferRequest,
+        ScatterTarget, ScatterTransferRequest, SingleTransferRequest,
         TransferCompletionEntry, TransferId, TransferRequest,
     },
     detect_topology,
@@ -141,6 +142,8 @@ fn avg_std(list: &[f64]) -> (usize, f64, f64) {
 enum RequestContent {
     Paged(Paged),
     Single(Single),
+    SingleAll(SingleAll),
+    A2a(A2a),
     Imm(Imm),
 }
 
@@ -186,6 +189,22 @@ struct Single {
     pub mr_desc: MemoryRegionDescriptor,
     pub offset: usize,
     pub len: usize,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SingleAll {
+    pub seed: Option<u64>,
+    pub mr_desc: Vec<MemoryRegionDescriptor>,
+    pub offset: usize,
+    pub len: usize,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct A2a {
+    pub seed: Option<u64>,
+    pub mr_desc: Vec<MemoryRegionDescriptor>,
+    pub offset: usize,
+    pub chunk_bytes: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -410,6 +429,96 @@ fn do_bench_write(
             transfer_requests = reqs;
         }
 
+        RequestContent::SingleAll(single) => {
+            if let Some(seed) = single.seed {
+                for (i, res) in cuda_res.iter().enumerate() {
+                    let mut tmp = vec![0u8; single.len];
+                    fill_random_bytes(&mut tmp, seed + i as u64);
+                    memcpy_h2d(
+                        unsafe { res.cuda_buf.ptr().byte_add(single.offset) },
+                        &tmp,
+                    );
+                }
+            }
+
+            total_ops = cuda_res.len();
+            total_bytes = single.len * cuda_res.len();
+            link_speed = engine.aggregated_link_speed() as f64;
+            let mut reqs = Vec::new();
+            for (i, res) in cuda_res.iter().enumerate() {
+                let id = TransferId(2500 + res.cuda_device as u64);
+                reqs.push((
+                    i,
+                    id,
+                    TransferRequest::Single(SingleTransferRequest {
+                        src_mr: res.cuda_mr_handle,
+                        src_offset: single.offset as u64,
+                        length: single.len as u64,
+                        imm_data: None,
+                        dst_mr: single.mr_desc[i].clone(),
+                        dst_offset: single.offset as u64,
+                        domain: DomainGroupRouting::RoundRobinSharded {
+                            num_shards: engine.nets_per_gpu(),
+                        },
+                    }),
+                ));
+            }
+            transfer_requests = reqs;
+        }
+
+        RequestContent::A2a(a2a) => {
+            let n = cuda_res.len();
+            if let Some(seed) = a2a.seed {
+                for (src_i, res) in cuda_res.iter().enumerate() {
+                    for dst_i in 0..n {
+                        let mut tmp = vec![0u8; a2a.chunk_bytes];
+                        fill_random_bytes(&mut tmp, seed + (src_i * n + dst_i) as u64);
+                        let offset = a2a.offset + dst_i * a2a.chunk_bytes;
+                        memcpy_h2d(
+                            unsafe { res.cuda_buf.ptr().byte_add(offset) },
+                            &tmp,
+                        );
+                    }
+                }
+            }
+
+            total_ops = n * n;
+            total_bytes = a2a.chunk_bytes * n * n;
+            link_speed = engine.aggregated_link_speed() as f64;
+            let mut reqs = Vec::new();
+            for (src_i, res) in cuda_res.iter().enumerate() {
+                let id = TransferId(2600 + res.cuda_device as u64);
+                let dsts = Arc::new(
+                    (0..n)
+                        .map(|k| {
+                            let dst_i = (src_i + k) % n;
+                            let dst_mr = &a2a.mr_desc[dst_i];
+                            ScatterTarget {
+                                dst_mr: dst_mr.clone(),
+                                length: a2a.chunk_bytes as u64,
+                                src_offset: (a2a.offset + dst_i * a2a.chunk_bytes)
+                                    as u64,
+                                dst_offset: (a2a.offset + src_i * a2a.chunk_bytes)
+                                    as u64,
+                            }
+                        })
+                        .collect(),
+                );
+                reqs.push((
+                    src_i,
+                    id,
+                    TransferRequest::Scatter(ScatterTransferRequest {
+                        src_mr: res.cuda_mr_handle,
+                        dst_handle: None,
+                        dsts,
+                        imm_data: None,
+                        domain: GroupTransferRouting::AllDomainsShardPeers,
+                    }),
+                ));
+            }
+            transfer_requests = reqs;
+        }
+
         RequestContent::Imm(imm) => {
             total_ops = 1;
             total_bytes = 4;
@@ -538,6 +647,12 @@ fn server_main(args: Vec<String>) -> anyhow::Result<()> {
             RequestContent::Single(single) => {
                 format!("Single: bytes={}", single.len)
             }
+            RequestContent::SingleAll(single) => {
+                format!("SingleAll: bytes/gpu={}", single.len)
+            }
+            RequestContent::A2a(a2a) => {
+                format!("A2A: chunk_bytes={}", a2a.chunk_bytes)
+            }
             RequestContent::Imm(_) => "Imm".to_string(),
         };
         print!("\rRequest: {} ...\x1b[K", msg);
@@ -623,6 +738,39 @@ fn generate_single_write_request(
     Single { seed, mr_desc: cuda_res[0].cuda_mr_desc.clone(), offset, len: write_bytes }
 }
 
+fn generate_single_all_write_request(
+    cuda_res: &[CudaResource],
+    write_bytes: usize,
+    verify: bool,
+) -> SingleAll {
+    let offset = 1024;
+    let seed = if verify { Some(0xabcdabcd987u64) } else { None };
+
+    SingleAll {
+        seed,
+        mr_desc: cuda_res.iter().map(|res| res.cuda_mr_desc.clone()).collect(),
+        offset,
+        len: write_bytes,
+    }
+}
+
+fn generate_a2a_write_request(
+    cuda_res: &[CudaResource],
+    chunk_bytes: usize,
+    verify: bool,
+) -> A2a {
+    let offset = 4096;
+    let seed = if verify { Some(0x1234abcd987u64) } else { None };
+    assert!(offset + chunk_bytes * cuda_res.len() <= CUDA_BUF_SIZE);
+
+    A2a {
+        seed,
+        mr_desc: cuda_res.iter().map(|res| res.cuda_mr_desc.clone()).collect(),
+        offset,
+        chunk_bytes,
+    }
+}
+
 fn verify_single_write(cuda_res: &[CudaResource], single: &Single) {
     if let Some(seed) = single.seed {
         let res = &cuda_res[0];
@@ -631,6 +779,34 @@ fn verify_single_write(cuda_res: &[CudaResource], single: &Single) {
         let mut tmp = vec![0u8; single.len];
         memcpy_d2h(&mut tmp, unsafe { res.cuda_buf.ptr().byte_add(single.offset) });
         assert!(gold == tmp);
+    }
+}
+
+fn verify_single_all_write(cuda_res: &[CudaResource], single: &SingleAll) {
+    if let Some(seed) = single.seed {
+        for (i, res) in cuda_res.iter().enumerate() {
+            let mut gold = vec![0u8; single.len];
+            fill_random_bytes(&mut gold, seed + i as u64);
+            let mut tmp = vec![0u8; single.len];
+            memcpy_d2h(&mut tmp, unsafe { res.cuda_buf.ptr().byte_add(single.offset) });
+            assert!(gold == tmp);
+        }
+    }
+}
+
+fn verify_a2a_write(cuda_res: &[CudaResource], a2a: &A2a) {
+    if let Some(seed) = a2a.seed {
+        let n = cuda_res.len();
+        for (dst_i, res) in cuda_res.iter().enumerate() {
+            for src_i in 0..n {
+                let mut gold = vec![0u8; a2a.chunk_bytes];
+                fill_random_bytes(&mut gold, seed + (src_i * n + dst_i) as u64);
+                let mut tmp = vec![0u8; a2a.chunk_bytes];
+                let offset = a2a.offset + src_i * a2a.chunk_bytes;
+                memcpy_d2h(&mut tmp, unsafe { res.cuda_buf.ptr().byte_add(offset) });
+                assert!(gold == tmp);
+            }
+        }
     }
 }
 
@@ -697,6 +873,12 @@ fn do_request(
         RequestContent::Single(single) => {
             verify_single_write(cuda_res, single);
         }
+        RequestContent::SingleAll(single) => {
+            verify_single_all_write(cuda_res, single);
+        }
+        RequestContent::A2a(a2a) => {
+            verify_a2a_write(cuda_res, a2a);
+        }
         RequestContent::Imm(_) => {}
     }
 
@@ -721,6 +903,123 @@ fn client_main(args: Vec<String>) -> anyhow::Result<()> {
 
     let MemoryResource { _host_box, host_buf, host_mr_handle, cuda_res } =
         alloc_and_register_memory(&selected_gpus, &engine)?;
+
+    let only_imm = std::env::var_os("PPLX_GARDEN_ONLY_IMM").is_some();
+    let only_single_all = std::env::var_os("PPLX_GARDEN_ONLY_SINGLE_ALL").is_some();
+    let only_a2a = std::env::var_os("PPLX_GARDEN_ONLY_A2A").is_some();
+
+    if only_imm {
+        println!("Bench Imm Write");
+        let imm = 20250501;
+        let content = RequestContent::Imm(Imm {
+            addr: engine.main_address(),
+            mr_desc: cuda_res[0].cuda_mr_desc.clone(),
+            imm,
+        });
+        let r = do_request(
+            &engine,
+            host_buf,
+            host_mr_handle,
+            &cuda_res,
+            server_addr.clone(),
+            content,
+        )?;
+        print!("  Imm VERIFIED ... ");
+        print!(" lat: {:3.3} ± {:3.3} µs", r.elapsed_avg * 1e6, r.elapsed_std * 1e6);
+        println!();
+        unregister_memory(&engine, host_buf, &cuda_res)?;
+        return Ok(());
+    }
+
+    if only_single_all {
+        println!("Bench Single-All Write");
+        for (write_bytes, verify) in [
+            (10000, true),
+            (1 << 20, false),
+            (2 << 20, false),
+            (4 << 20, false),
+            (8 << 20, false),
+            (16 << 20, false),
+            (32 << 20, false),
+            (64 << 20, false),
+        ] {
+            print!("  bytes/gpu: {:8} ...", write_bytes);
+            stdout().flush()?;
+            let content = RequestContent::SingleAll(generate_single_all_write_request(
+                &cuda_res,
+                write_bytes,
+                verify,
+            ));
+            let r = do_request(
+                &engine,
+                host_buf,
+                host_mr_handle,
+                &cuda_res,
+                server_addr.clone(),
+                content,
+            )?;
+            if verify {
+                println!(" VERIFIED");
+                continue;
+            }
+            print!(
+                " lat: {:6.3} ± {:6.3} ms",
+                r.elapsed_avg * 1e3,
+                r.elapsed_std * 1e3
+            );
+            print!(", bw: {:4.0} ± {:4.0} Gbps", r.bw_avg / 1e9, r.bw_std / 1e9);
+            print!(" ({:2.0}%)", r.bw_pct);
+            println!();
+        }
+        unregister_memory(&engine, host_buf, &cuda_res)?;
+        return Ok(());
+    }
+
+    if only_a2a {
+        println!("Bench Coalesced A2A Write");
+        for (chunk_bytes, verify) in [
+            (10000, true),
+            (256 << 10, false),
+            (512 << 10, false),
+            (1 << 20, false),
+            (2 << 20, false),
+            (4 << 20, false),
+            (8 << 20, false),
+            (16 << 20, false),
+            (32 << 20, false),
+        ] {
+            print!("  chunk_bytes: {:8} ...", chunk_bytes);
+            stdout().flush()?;
+            let content = RequestContent::A2a(generate_a2a_write_request(
+                &cuda_res,
+                chunk_bytes,
+                verify,
+            ));
+            let r = do_request(
+                &engine,
+                host_buf,
+                host_mr_handle,
+                &cuda_res,
+                server_addr.clone(),
+                content,
+            )?;
+            if verify {
+                println!(" VERIFIED");
+                continue;
+            }
+            print!(
+                " lat: {:6.3} ± {:6.3} ms",
+                r.elapsed_avg * 1e3,
+                r.elapsed_std * 1e3
+            );
+            print!(", bw: {:4.0} ± {:4.0} Gbps", r.bw_avg / 1e9, r.bw_std / 1e9);
+            print!(" ({:2.0}%)", r.bw_pct);
+            print!(", ops: {:6.3} Mops/s", r.pps_avg / 1e6);
+            println!();
+        }
+        unregister_memory(&engine, host_buf, &cuda_res)?;
+        return Ok(());
+    }
 
     println!("Bench Paged Write");
     for (page_bytes, num_pages, verify) in [
@@ -787,6 +1086,42 @@ fn client_main(args: Vec<String>) -> anyhow::Result<()> {
         print!("  bytes: {:8} ...", write_bytes);
         stdout().flush()?;
         let content = RequestContent::Single(generate_single_write_request(
+            &cuda_res,
+            write_bytes,
+            verify,
+        ));
+        let r = do_request(
+            &engine,
+            host_buf,
+            host_mr_handle,
+            &cuda_res,
+            server_addr.clone(),
+            content,
+        )?;
+        if verify {
+            println!(" VERIFIED");
+            continue;
+        }
+        print!(" lat: {:6.3} ± {:6.3} ms", r.elapsed_avg * 1e3, r.elapsed_std * 1e3);
+        print!(", bw: {:4.0} ± {:4.0} Gbps", r.bw_avg / 1e9, r.bw_std / 1e9);
+        print!(" ({:2.0}%)", r.bw_pct);
+        println!();
+    }
+
+    println!("Bench Single-All Write");
+    for (write_bytes, verify) in [
+        (10000, true),
+        (1 << 20, false),
+        (2 << 20, false),
+        (4 << 20, false),
+        (8 << 20, false),
+        (16 << 20, false),
+        (32 << 20, false),
+        (64 << 20, false),
+    ] {
+        print!("  bytes/gpu: {:8} ...", write_bytes);
+        stdout().flush()?;
+        let content = RequestContent::SingleAll(generate_single_all_write_request(
             &cuda_res,
             write_bytes,
             verify,
