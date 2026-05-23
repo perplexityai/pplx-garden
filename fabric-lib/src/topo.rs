@@ -12,6 +12,7 @@ use once_cell::sync::Lazy;
 use crate::{
     efa::{EfaDomainInfo, get_efa_domains},
     error::{FabricLibError, Result},
+    provider::RdmaDomainInfo,
     provider_dispatch::DomainInfo,
     verbs::{VerbsDeviceInfo, VerbsDeviceList},
 };
@@ -84,6 +85,25 @@ impl From<&cudaDeviceProp> for PciAddress {
 impl From<&EfaDomainInfo> for PciAddress {
     fn from(domain: &EfaDomainInfo) -> Self {
         let fi_ref = unsafe { domain.fi().as_ref() };
+        if unsafe { fi_ref.nic.as_ref() }.is_none() {
+            let name = unsafe {
+                CStr::from_ptr((*fi_ref.domain_attr).name).to_string_lossy()
+            };
+            let cxi_name = name
+                .strip_prefix("hsn")
+                .map(|index| format!("cxi{index}"))
+                .or_else(|| name.strip_prefix("cxi").map(|index| format!("cxi{index}")))
+                .expect("NIC is null and CXI domain name is not hsnN/cxiN");
+            let device_path = std::fs::read_link(format!("/sys/class/cxi/{cxi_name}/device"))
+                .expect("NIC is null and CXI sysfs device link is unavailable");
+            let pci_addr = device_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("NIC is null and CXI PCI path has no file name");
+            return pci_addr
+                .parse::<PciAddress>()
+                .expect("NIC is null and CXI PCI address could not be parsed");
+        }
         let pci = unsafe {
             fi_ref
                 .nic
@@ -158,6 +178,7 @@ struct PciDeviceId {
 fn get_numa_physical_cpus() -> Result<Vec<Vec<u16>>> {
     // Get all CPUs by NUMA node
     let mut numa_map = HashMap::new();
+    let mut numa_all_cpus = Vec::new();
     for entry in std::fs::read_dir("/sys/devices/system/node").map_err(|_| {
         FabricLibError::Custom("Failed to read /sys/devices/system/node")
     })? {
@@ -182,6 +203,10 @@ fn get_numa_physical_cpus() -> Result<Vec<Vec<u16>>> {
                 )
             })?;
         let cpulist = parse_comma_dash_int_list(&cpulist);
+        if numa_idx >= numa_all_cpus.len() {
+            numa_all_cpus.resize_with(numa_idx + 1, Vec::new);
+        }
+        numa_all_cpus[numa_idx] = cpulist.clone();
         for cpu in cpulist {
             numa_map.insert(cpu, numa_idx);
         }
@@ -227,7 +252,7 @@ fn get_numa_physical_cpus() -> Result<Vec<Vec<u16>>> {
         }
     }
 
-    Ok(numa)
+    if numa.is_empty() { Ok(numa_all_cpus) } else { Ok(numa) }
 }
 
 fn parse_comma_dash_int_list(s: &str) -> Vec<u16> {
@@ -386,6 +411,64 @@ struct PciTopoGroup {
     cpus: Vec<u16>,
 }
 
+fn numa_topology_requested() -> bool {
+    matches!(
+        std::env::var("PPLX_GARDEN_TOPOLOGY_NUMA").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+fn detect_numa_topo(
+    all_gpus: &[&PciProp],
+    all_nics: &[&PciProp],
+    numa_cpus: &[Vec<u16>],
+) -> Vec<PciTopoGroup> {
+    let mut system_topo = Vec::new();
+    let mut numa_gpu_count = vec![0; numa_cpus.len()];
+    let mut numa_nic_count = vec![0; numa_cpus.len()];
+    for gpu in all_gpus {
+        numa_gpu_count[gpu.numa_node] += 1;
+    }
+    for nic in all_nics {
+        numa_nic_count[nic.numa_node] += 1;
+    }
+
+    let mut numa_gpu_indices = vec![0; numa_cpus.len()];
+    let mut sorted_gpus = all_gpus.to_vec();
+    sorted_gpus.sort_by_key(|g| g.pci_addr);
+    for gpu in sorted_gpus {
+        let gpu_count = numa_gpu_count[gpu.numa_node];
+        let nic_count = numa_nic_count[gpu.numa_node];
+        if gpu_count == 0 || nic_count == 0 {
+            continue;
+        }
+
+        let numa_gpu_index = numa_gpu_indices[gpu.numa_node];
+        numa_gpu_indices[gpu.numa_node] += 1;
+        let nics_per_gpu = nic_count / gpu_count;
+        if nics_per_gpu == 0 {
+            continue;
+        }
+
+        let mut numa_nics: Vec<_> =
+            all_nics.iter().filter(|n| n.numa_node == gpu.numa_node).copied().collect();
+        numa_nics.sort_by_key(|n| n.pci_addr);
+        let nic_start = numa_gpu_index * nics_per_gpu;
+        let nics = &numa_nics[nic_start..nic_start + nics_per_gpu];
+
+        let cpus_per_gpu = numa_cpus[gpu.numa_node].len() / gpu_count;
+        let cpu_start = numa_gpu_index * cpus_per_gpu;
+        let cpus = &numa_cpus[gpu.numa_node][cpu_start..cpu_start + cpus_per_gpu];
+        system_topo.push(PciTopoGroup {
+            gpu: (*gpu).clone(),
+            nics: nics.iter().map(|x| (*x).clone()).collect(),
+            cpus: cpus.to_vec(),
+        });
+    }
+
+    system_topo
+}
+
 /// Detects the topology of the system, regardless of visibility.
 /// Assuming homogeneous GPUs and homogeneous NICs.
 fn detect_system_topo(
@@ -423,6 +506,9 @@ fn detect_system_topo(
 
     // Get NUMA physical CPUs
     let numa_cpus = get_numa_physical_cpus()?;
+    if numa_topology_requested() {
+        return Ok(detect_numa_topo(&all_gpus, &all_nics, &numa_cpus));
+    }
 
     // Count GPUs per NUMA node
     let mut numa_gpu_count = vec![0; numa_cpus.len()];
@@ -459,7 +545,14 @@ fn detect_system_topo(
 
 fn get_visible_domains() -> Vec<DomainInfo> {
     // Try EFA first
-    let efa_domains = get_efa_domains().unwrap_or_default();
+    let mut efa_domains = get_efa_domains().unwrap_or_default();
+    if matches!(
+        std::env::var("PPLX_GARDEN_LIBFABRIC_PROVIDER").as_deref(),
+        Ok("cxi")
+    ) {
+        efa_domains
+            .retain(|domain| domain.name().starts_with("hsn") || domain.name().starts_with("cxi"));
+    }
     if !efa_domains.is_empty() {
         return efa_domains.into_iter().map(DomainInfo::Efa).collect();
     }
@@ -505,8 +598,10 @@ fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
     let system_topo = detect_system_topo(gpu_pci_device_id, nic_pci_device_id)?;
 
     // Only keep visible NICs and GPUs (e.g., due to containerization)
-    let mut visible_nics: HashMap<_, _> =
-        domains.iter().map(|info| (PciAddress::from(info), info.clone())).collect();
+    let mut visible_nics = HashMap::new();
+    for info in &domains {
+        visible_nics.entry(PciAddress::from(info)).or_insert_with(|| info.clone());
+    }
     let mut visible_gpus = HashMap::new();
     for cuda_device in 0..num_visible_gpus {
         let prop = cudaGetDeviceProperties(cuda_device as i32)?;

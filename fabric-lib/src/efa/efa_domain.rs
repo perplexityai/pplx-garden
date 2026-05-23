@@ -8,13 +8,15 @@ use std::{
 };
 
 use bytes::Bytes;
+use cuda_lib::{Device, rt::cudaSetDevice};
 use libfabric_sys::{
     FI_ADDR_UNSPEC, FI_CQ_FORMAT_DATA, FI_EAGAIN, FI_EAVAIL, FI_ENABLE, FI_HMEM_CUDA,
-    FI_MR_DMABUF, FI_OPT_CUDA_API_PERMITTED, FI_OPT_ENDPOINT,
-    FI_OPT_SHARED_MEMORY_PERMITTED, FI_READ, FI_RECV, FI_REMOTE_READ, FI_REMOTE_WRITE,
-    FI_SEND, FI_WRITE, fi_addr_t, fi_av_attr, fi_close, fi_cq_attr, fi_cq_data_entry,
-    fi_cq_err_entry, fi_fabric, fi_mr_attr, fi_mr_dmabuf, fid_av, fid_cq, fid_domain,
-    fid_ep, fid_fabric, fid_mr, iovec,
+    FI_MR_DMABUF, FI_MR_ENDPOINT, FI_MR_LOCAL, FI_MR_VIRT_ADDR,
+    FI_OPT_CUDA_API_PERMITTED, FI_OPT_ENDPOINT, FI_OPT_SHARED_MEMORY_PERMITTED,
+    FI_READ, FI_RECV, FI_REMOTE_READ, FI_REMOTE_WRITE, FI_RMA_EVENT, FI_SEND, FI_WRITE,
+    fi_addr_t, fi_av_attr, fi_close, fi_cq_attr, fi_cq_data_entry, fi_cq_err_entry,
+    fi_fabric, fi_mr_attr, fi_mr_dmabuf, fi_msg, fid_av, fid_cq, fid_domain, fid_ep,
+    fid_fabric, fid_mr, iovec,
 };
 use tracing::{debug, error, warn};
 
@@ -48,13 +50,25 @@ pub struct EfaDomain {
     peer_addr_map: HashMap<DomainAddress, fi_addr_t>,
     peer_groups: HashMap<PeerGroupHandle, PeerGroup>,
     local_mr_map: HashMap<NonNull<c_void>, NonNull<fid_mr>>,
+    use_local_mr_desc: bool,
+    use_endpoint_mr: bool,
+    use_remote_virt_addr: bool,
+    use_cuda_dmabuf: bool,
+    use_rma_event_mr: bool,
+    use_send_for_imm: bool,
     imm_count_map: Arc<ImmCountMap>,
     objpool_write_op: ObjectPool<WriteOpContext>,
     objpool_msg: ObjectPool<RmaBuffer>,
 
     recv_ops: VecDeque<RecvOpContext>,
     send_ops: VecDeque<SendOpContext>,
+    imm_send_ops: VecDeque<ImmSendContext>,
+    imm_send_pending: HashMap<TransferId, usize>,
+    imm_send_pending_bufs: Vec<(TransferId, Box<[u8; IMM_MSG_BYTES]>)>,
     write_ops: VecDeque<NonNull<WriteOpContext>>,
+    imm_recv_slots: Vec<ImmRecvSlot>,
+    imm_recvs_posted: bool,
+    imm_recv_addr: fi_addr_t,
 
     completions: VecDeque<DomainCompletionEntry>,
 }
@@ -74,6 +88,16 @@ struct SendOpContext {
     op: SendOp,
 }
 
+struct ImmSendContext {
+    transfer_id: TransferId,
+    dest_addr: fi_addr_t,
+    imm: Box<[u8; IMM_MSG_BYTES]>,
+}
+
+struct ImmRecvSlot {
+    buf: Box<[u8; IMM_MSG_BYTES]>,
+}
+
 struct WriteOpContext {
     transfer_id: TransferId,
     rdma_op_iter: WriteOpIter,
@@ -88,15 +112,39 @@ struct WriteOpContext {
     /// No more write ops will be posted.
     /// Once cnt_finished_ops catches up with cnt_posted_ops, the context will be dropped.
     bad: bool,
+    imm_after_write: Option<Vec<(fi_addr_t, u32)>>,
 }
 
 const EAGAIN: isize = -(FI_EAGAIN as isize);
+const IMM_RECV_POOL_SIZE: usize = 256;
+const IMM_MSG_BYTES: usize = 64;
 
 impl EfaDomain {
     fn open(info: EfaDomainInfo, imm_count_map: Arc<ImmCountMap>) -> Result<Self> {
         unsafe {
             debug!("Domain::open: name: {}", info.name());
             let fi = info.fi();
+            let provider_name = CStr::from_ptr((*(*fi.as_ptr()).fabric_attr).prov_name)
+                .to_string_lossy();
+            let is_efa = provider_name == "efa";
+            let mr_mode = (*(*fi.as_ptr()).domain_attr).mr_mode;
+            let use_local_mr_desc = mr_mode & FI_MR_LOCAL as i32 != 0;
+            let use_endpoint_mr = mr_mode & FI_MR_ENDPOINT as i32 != 0;
+            let use_remote_virt_addr = mr_mode & FI_MR_VIRT_ADDR as i32 != 0;
+            let use_send_for_imm = provider_name != "efa"
+                && std::env::var_os("PPLX_GARDEN_CXI_SEND_IMM_FALLBACK").is_some();
+            if std::env::var_os("PPLX_GARDEN_DEBUG_FI").is_some() {
+                eprintln!(
+                    "pplx domain open name={} provider={} mr_mode=0x{:x} local_desc={} endpoint_mr={} virt_addr={} send_imm_fallback={}",
+                    info.name(),
+                    provider_name,
+                    mr_mode,
+                    use_local_mr_desc,
+                    use_endpoint_mr,
+                    use_remote_virt_addr,
+                    use_send_for_imm
+                );
+            }
 
             // Fabric
             let mut fabric = null_mut();
@@ -162,37 +210,39 @@ impl EfaDomain {
                 return Err(LibfabricError::new(ret, "fi_ep_bind av").into());
             }
 
-            // Disallow using shm and cuda p2p transfer.
-            // All data transfer should go through RDMA.
-            let optval = false;
-            let fi_setopt = (*(*ep.as_ptr()).ops).setopt.unwrap_unchecked();
-            let ret = fi_setopt(
-                ep_fid,
-                FI_OPT_ENDPOINT as i32,
-                FI_OPT_SHARED_MEMORY_PERMITTED as i32,
-                &optval as *const _ as *mut c_void,
-                std::mem::size_of_val(&optval),
-            );
-            if ret != 0 {
-                return Err(LibfabricError::new(
-                    ret,
-                    "fi_setopt FI_OPT_SHARED_MEMORY_PERMITTED false",
-                )
-                .into());
-            }
-            let ret = fi_setopt(
-                ep_fid,
-                FI_OPT_ENDPOINT as i32,
-                FI_OPT_CUDA_API_PERMITTED as i32,
-                &optval as *const _ as *mut c_void,
-                std::mem::size_of_val(&optval),
-            );
-            if ret != 0 {
-                return Err(LibfabricError::new(
-                    ret,
-                    "fi_setopt FI_OPT_CUDA_API_PERMITTED false",
-                )
-                .into());
+            if is_efa {
+                // Disallow using shm and cuda p2p transfer.
+                // All data transfer should go through RDMA.
+                let optval = false;
+                let fi_setopt = (*(*ep.as_ptr()).ops).setopt.unwrap_unchecked();
+                let ret = fi_setopt(
+                    ep_fid,
+                    FI_OPT_ENDPOINT as i32,
+                    FI_OPT_SHARED_MEMORY_PERMITTED as i32,
+                    &optval as *const _ as *mut c_void,
+                    std::mem::size_of_val(&optval),
+                );
+                if ret != 0 {
+                    return Err(LibfabricError::new(
+                        ret,
+                        "fi_setopt FI_OPT_SHARED_MEMORY_PERMITTED false",
+                    )
+                    .into());
+                }
+                let ret = fi_setopt(
+                    ep_fid,
+                    FI_OPT_ENDPOINT as i32,
+                    FI_OPT_CUDA_API_PERMITTED as i32,
+                    &optval as *const _ as *mut c_void,
+                    std::mem::size_of_val(&optval),
+                );
+                if ret != 0 {
+                    return Err(LibfabricError::new(
+                        ret,
+                        "fi_setopt FI_OPT_CUDA_API_PERMITTED false",
+                    )
+                    .into());
+                }
             }
 
             // Enable endpoint
@@ -223,7 +273,7 @@ impl EfaDomain {
             defer_av.cancel();
             defer_ep.cancel();
 
-            Ok(Self {
+            let slf = Self {
                 info,
                 fabric,
                 domain,
@@ -235,16 +285,36 @@ impl EfaDomain {
                 peer_addr_map: HashMap::new(),
                 peer_groups: HashMap::new(),
                 local_mr_map: HashMap::new(),
+                use_local_mr_desc,
+                use_endpoint_mr,
+                use_remote_virt_addr,
+                use_cuda_dmabuf: is_efa,
+                use_rma_event_mr: std::env::var_os("PPLX_GARDEN_CXI_RMA_EVENT_MR")
+                    .is_some(),
+                use_send_for_imm,
                 objpool_write_op: ObjectPool::with_chunk_size(1024),
                 objpool_msg: ObjectPool::with_chunk_size(1024),
                 imm_count_map,
 
                 recv_ops: VecDeque::new(),
                 send_ops: VecDeque::new(),
+                imm_send_ops: VecDeque::new(),
+                imm_send_pending: HashMap::new(),
+                imm_send_pending_bufs: Vec::new(),
                 write_ops: VecDeque::new(),
+                imm_recv_slots: if use_send_for_imm {
+                    (0..IMM_RECV_POOL_SIZE)
+                        .map(|_| ImmRecvSlot { buf: Box::new([0; IMM_MSG_BYTES]) })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                imm_recvs_posted: false,
+                imm_recv_addr: FI_ADDR_UNSPEC,
 
                 completions: VecDeque::new(),
-            })
+            };
+            Ok(slf)
         }
     }
 
@@ -287,6 +357,9 @@ impl EfaDomain {
         let mut access = (FI_SEND | FI_RECV | FI_WRITE | FI_READ) as u64;
         if allow_remote {
             access |= (FI_REMOTE_WRITE | FI_REMOTE_READ) as u64;
+            if self.use_rma_event_mr {
+                access |= FI_RMA_EVENT;
+            }
         }
 
         let mut mr = null_mut();
@@ -308,13 +381,44 @@ impl EfaDomain {
                 mr_attr.device.cuda = device_id.0 as i32;
                 mr_attr.__bindgen_anon_1.mr_iov = &iov;
             }
-            Mapping::Device { device_id, dmabuf_fd: Some(dmabuf_fd) } => {
+            Mapping::Device { device_id, dmabuf_fd: Some(dmabuf_fd) }
+                if self.use_cuda_dmabuf =>
+            {
                 mr_attr.iface = FI_HMEM_CUDA;
                 mr_attr.device.cuda = device_id.0 as i32;
                 dmabuf.fd = *dmabuf_fd;
                 mr_attr.__bindgen_anon_1.dmabuf = &dmabuf;
                 flags = FI_MR_DMABUF;
             }
+            Mapping::Device { device_id, dmabuf_fd: Some(_) } => {
+                mr_attr.iface = FI_HMEM_CUDA;
+                mr_attr.device.cuda = device_id.0 as i32;
+                mr_attr.__bindgen_anon_1.mr_iov = &iov;
+            }
+        }
+        if let Mapping::Device { device_id, .. } = region.mapping() {
+            cudaSetDevice(device_id.0 as i32)?;
+        }
+        if std::env::var_os("PPLX_GARDEN_DEBUG_FI").is_some() {
+            let mapping = match region.mapping() {
+                Mapping::Host => "host".to_string(),
+                Mapping::Device { device_id, dmabuf_fd } => format!(
+                    "cuda device={} dmabuf={} use_cuda_dmabuf={}",
+                    device_id.0,
+                    dmabuf_fd.is_some(),
+                    self.use_cuda_dmabuf
+                ),
+            };
+            eprintln!(
+                "pplx mr register ptr={:?} len={} allow_remote={} access=0x{:x} flags=0x{:x} iface={} mapping={}",
+                region.ptr(),
+                region.len(),
+                allow_remote,
+                access,
+                flags,
+                mr_attr.iface,
+                mapping
+            );
         }
 
         let ret = unsafe {
@@ -323,17 +427,112 @@ impl EfaDomain {
             let domain_fid = &raw mut (*self.domain.as_ptr()).fid;
             fi_mr_regattr(domain_fid, &mr_attr, flags, &raw mut mr)
         };
+        if std::env::var_os("PPLX_GARDEN_DEBUG_FI").is_some() {
+            eprintln!("pplx mr register ret={} mr={:?}", ret, mr);
+        }
 
         let mr = NonNull::new(mr)
             .ok_or_else(|| LibfabricError::new(ret, "fi_mr_regattr"))?;
+        if self.use_endpoint_mr {
+            unsafe {
+                let mr_fid = &raw mut (*mr.as_ptr()).fid;
+                let ep_fid = &raw mut (*self.ep.as_ptr()).fid;
+                let fi_bind = (*(*mr_fid).ops).bind.unwrap_unchecked();
+                let ret = fi_bind(mr_fid, ep_fid, 0);
+                if ret != 0 {
+                    fi_close(mr_fid);
+                    return Err(LibfabricError::new(ret, "fi_mr_bind ep").into());
+                }
+                let fi_control = (*(*mr_fid).ops).control.unwrap_unchecked();
+                let ret = fi_control(mr_fid, FI_ENABLE as i32, null_mut());
+                if ret != 0 {
+                    fi_close(mr_fid);
+                    return Err(LibfabricError::new(ret, "fi_mr_enable").into());
+                }
+            }
+        }
         self.local_mr_map.insert(region.ptr(), mr);
         Ok(MemoryRegionRemoteKey(unsafe { mr.as_ref() }.key))
     }
 
     fn progress_ops(&mut self) {
         self.progress_rdma_recv_ops();
+        self.progress_imm_send_ops();
         self.progress_rdma_send_ops();
         self.progress_rdma_write_ops();
+    }
+
+    fn post_imm_recv_slot(&mut self, idx: usize) -> Result<()> {
+        let slot = &mut self.imm_recv_slots[idx];
+        let mut iov = iovec {
+            iov_base: slot.buf.as_mut_ptr() as *mut c_void,
+            iov_len: slot.buf.len(),
+        };
+        let mut msg = fi_msg {
+            msg_iov: &raw mut iov,
+            desc: null_mut(),
+            iov_count: 1,
+            addr: self.imm_recv_addr,
+            context: (&mut self.imm_recv_slots[idx]) as *mut ImmRecvSlot as *mut c_void,
+            data: 0,
+        };
+        let ret = unsafe {
+            let fi_recvmsg = (*(*self.ep.as_ptr()).msg).recvmsg.unwrap_unchecked();
+            fi_recvmsg(self.ep.as_ptr(), &raw mut msg, 0)
+        };
+        if ret != 0 {
+            return Err(LibfabricError::new(ret as i32, "fi_recvmsg imm").into());
+        }
+        Ok(())
+    }
+
+    fn ensure_imm_recvs_posted(&mut self, _addr: fi_addr_t) -> Result<()> {
+        if self.imm_recvs_posted {
+            return Ok(());
+        }
+        self.imm_recv_addr = FI_ADDR_UNSPEC;
+        for idx in 0..self.imm_recv_slots.len() {
+            let ptr =
+                NonNull::new(self.imm_recv_slots[idx].buf.as_mut_ptr() as *mut c_void)
+                    .unwrap();
+            let region = MemoryRegion::new(ptr, IMM_MSG_BYTES, Device::Host)?;
+            self.register_mr(&region, false)?;
+            self.post_imm_recv_slot(idx)?;
+        }
+        self.imm_recvs_posted = true;
+        Ok(())
+    }
+
+    fn progress_imm_send_ops(&mut self) {
+        while let Some(ctx) = self.imm_send_ops.front() {
+            let mut iov = iovec {
+                iov_base: ctx.imm.as_ptr() as *mut c_void,
+                iov_len: ctx.imm.len(),
+            };
+            let mut msg = fi_msg {
+                msg_iov: &raw mut iov,
+                desc: null_mut(),
+                iov_count: 1,
+                addr: ctx.dest_addr,
+                context: unsafe {
+                    transmute::<TransferId, *mut libc::c_void>(ctx.transfer_id)
+                },
+                data: 0,
+            };
+            let ret = unsafe {
+                let fi_sendmsg = (*(*self.ep.as_ptr()).msg).sendmsg.unwrap_unchecked();
+                fi_sendmsg(self.ep.as_ptr(), &raw mut msg, 0)
+            };
+            match ret {
+                0 => {
+                    let ctx = self.imm_send_ops.pop_front().unwrap();
+                    *self.imm_send_pending.entry(ctx.transfer_id).or_insert(0) += 1;
+                    self.imm_send_pending_bufs.push((ctx.transfer_id, ctx.imm));
+                }
+                EAGAIN => break,
+                _ => panic!("fi_sendmsg imm returned undocumented error: {}", ret),
+            }
+        }
     }
 
     fn progress_rdma_recv_ops(&mut self) {
@@ -388,6 +587,7 @@ impl EfaDomain {
     fn do_submit_write<F: FnOnce(*mut c_void, NonNull<RmaBuffer>) -> WriteOpIter>(
         &mut self,
         transfer_id: TransferId,
+        imm_after_write: Option<Vec<(fi_addr_t, u32)>>,
         construct_rdma_op_iter: F,
     ) {
         // Allocate the memory for the context and make it float in the heap.
@@ -415,6 +615,7 @@ impl EfaDomain {
                 cnt_finished_ops: 0,
                 in_queue: false,
                 bad: false,
+                imm_after_write,
             })
         };
         let context_ptr = unsafe { NonNull::new_unchecked(context) };
@@ -439,11 +640,66 @@ impl EfaDomain {
         addrs: Rc<Vec<fi_addr_t>>,
         op: GroupWriteOp,
     ) {
-        self.do_submit_write(transfer_id, |rawctx, msg_buf| match op {
+        self.do_submit_write(transfer_id, None, |rawctx, msg_buf| match op {
             GroupWriteOp::Scatter(op) => WriteOpIter::Scatter(ScatterWriteOpIter::new(
                 op, addrs, msg_buf, rawctx,
             )),
         });
+    }
+
+    fn send_imm_after_write(
+        &mut self,
+        transfer_id: TransferId,
+        imm_after_write: Option<Vec<(fi_addr_t, u32)>>,
+    ) -> Option<DomainCompletionEntry> {
+        let Some(imm_after_write) = imm_after_write else {
+            return Some(DomainCompletionEntry::Transfer(transfer_id));
+        };
+        if imm_after_write.is_empty() {
+            return Some(DomainCompletionEntry::Transfer(transfer_id));
+        }
+        for (dest_addr, imm_data) in imm_after_write {
+            self.imm_send_ops.push_back(ImmSendContext {
+                transfer_id,
+                dest_addr,
+                imm: {
+                    let mut buf = Box::new([0; IMM_MSG_BYTES]);
+                    buf[..4].copy_from_slice(&imm_data.to_ne_bytes());
+                    buf
+                },
+            });
+        }
+        self.progress_imm_send_ops();
+        None
+    }
+
+    fn normalize_remote_addr_write_op(&self, mut op: WriteOp) -> WriteOp {
+        if self.use_remote_virt_addr {
+            return op;
+        }
+        match &mut op {
+            WriteOp::Single(op) => op.dst_ptr = 0,
+            WriteOp::Imm(op) => op.dst_ptr = 0,
+            WriteOp::Paged(op) => op.dst_ptr = 0,
+        }
+        op
+    }
+
+    fn normalize_remote_addr_group_write_op(
+        &self,
+        mut op: GroupWriteOp,
+    ) -> GroupWriteOp {
+        if self.use_remote_virt_addr {
+            return op;
+        }
+        match &mut op {
+            GroupWriteOp::Scatter(op) => {
+                for dst in Arc::make_mut(&mut op.dsts) {
+                    dst.dst_mr.ptr = 0;
+                }
+            }
+        }
+        op
     }
 
     fn progress_rdma_write_op_context(context: &mut WriteOpContext, max_submit: usize) {
@@ -549,18 +805,50 @@ impl EfaDomain {
 
             // Transfer is done.
             let transfer_id = context.transfer_id;
+            let imm_after_write = context.imm_after_write.take();
             self.maybe_drop_write_op_context(unsafe {
                 NonNull::new_unchecked(context)
             });
-            return Some(DomainCompletionEntry::Transfer(transfer_id));
+            return self.send_imm_after_write(transfer_id, imm_after_write);
         }
 
         if cqe.flags & FI_SEND as u64 != 0 {
             let transfer_id: TransferId = unsafe { transmute(cqe.op_context) };
+            if let Some(count) = self.imm_send_pending.get_mut(&transfer_id) {
+                *count -= 1;
+                if *count == 0 {
+                    self.imm_send_pending.remove(&transfer_id);
+                }
+                if let Some(idx) = self
+                    .imm_send_pending_bufs
+                    .iter()
+                    .position(|(id, _)| *id == transfer_id)
+                {
+                    self.imm_send_pending_bufs.swap_remove(idx);
+                }
+                return Some(DomainCompletionEntry::Transfer(transfer_id));
+            }
             return Some(DomainCompletionEntry::Send(transfer_id));
         }
 
         if cqe.flags & FI_RECV as u64 != 0 {
+            if let Some(idx) = self.imm_recv_slots.iter().position(|slot| {
+                std::ptr::eq(slot, cqe.op_context as *const ImmRecvSlot)
+            }) {
+                let imm = u32::from_ne_bytes(
+                    self.imm_recv_slots[idx].buf[..4].try_into().unwrap(),
+                );
+                if let Err(err) = self.post_imm_recv_slot(idx) {
+                    error!(?err, idx, "Failed to repost CXI immediate receive");
+                }
+                return match self.imm_count_map.inc(imm) {
+                    ImmCountStatus::Vacant => Some(DomainCompletionEntry::ImmData(imm)),
+                    ImmCountStatus::NotReached => None,
+                    ImmCountStatus::Reached => {
+                        Some(DomainCompletionEntry::ImmCountReached(imm))
+                    }
+                };
+            }
             let transfer_id: TransferId = unsafe { transmute(cqe.op_context) };
             return Some(DomainCompletionEntry::Recv {
                 transfer_id,
@@ -718,6 +1006,9 @@ impl RdmaDomain for EfaDomain {
         &self,
         ptr: NonNull<c_void>,
     ) -> Result<MemoryRegionLocalDescriptor> {
+        if !self.use_local_mr_desc {
+            return Ok(MemoryRegionLocalDescriptor(0));
+        }
         let mr = self
             .local_mr_map
             .get(&ptr)
@@ -746,6 +1037,12 @@ impl RdmaDomain for EfaDomain {
             ));
             return;
         };
+        if self.use_send_for_imm
+            && let Err(err) = self.ensure_imm_recvs_posted(dest_fi_addr)
+        {
+            self.completions.push_back(DomainCompletionEntry::Error(transfer_id, err));
+            return;
+        }
 
         // Add to the flying transfer queue
         self.send_ops.push_back(SendOpContext {
@@ -772,8 +1069,49 @@ impl RdmaDomain for EfaDomain {
             ));
             return;
         };
+        if self.use_send_for_imm
+            && let Err(err) = self.ensure_imm_recvs_posted(dest_fi_addr)
+        {
+            self.completions.push_back(DomainCompletionEntry::Error(transfer_id, err));
+            return;
+        }
 
-        self.do_submit_write(transfer_id, |rawctx, msg_buf| match op {
+        if self.use_send_for_imm
+            && let WriteOp::Imm(op) = op
+        {
+            self.imm_send_ops.push_back(ImmSendContext {
+                transfer_id,
+                dest_addr: dest_fi_addr,
+                imm: {
+                    let mut buf = Box::new([0; IMM_MSG_BYTES]);
+                    buf[..4].copy_from_slice(&op.imm_data.to_ne_bytes());
+                    buf
+                },
+            });
+            self.progress_imm_send_ops();
+            return;
+        }
+
+        let mut imm_after_write = None;
+        let mut op = op;
+        if self.use_send_for_imm {
+            match &mut op {
+                WriteOp::Single(op) => {
+                    if let Some(imm_data) = op.imm_data.take() {
+                        imm_after_write = Some(vec![(dest_fi_addr, imm_data)]);
+                    }
+                }
+                WriteOp::Paged(op) => {
+                    if let Some(imm_data) = op.imm_data.take() {
+                        imm_after_write = Some(vec![(dest_fi_addr, imm_data)]);
+                    }
+                }
+                WriteOp::Imm(_) => {}
+            }
+        }
+
+        let op = self.normalize_remote_addr_write_op(op);
+        self.do_submit_write(transfer_id, imm_after_write, |rawctx, msg_buf| match op {
             WriteOp::Single(op) => WriteOpIter::Single(SingleWriteOpIter::new_single(
                 op,
                 dest_fi_addr,
@@ -844,7 +1182,44 @@ impl RdmaDomain for EfaDomain {
             }
             Rc::new(fi_addrs)
         };
-        self.do_submit_group_write(transfer_id, addrs, op);
+        if self.use_send_for_imm {
+            let has_imm = match &op {
+                GroupWriteOp::Scatter(op) => op.imm_data.is_some(),
+            };
+            if has_imm && let Some(addr) = addrs.first() {
+                if let Err(err) = self.ensure_imm_recvs_posted(*addr) {
+                    self.completions.push_back(DomainCompletionEntry::Error(
+                        transfer_id,
+                        err,
+                    ));
+                    return;
+                }
+            }
+        }
+        let mut imm_after_write = None;
+        let mut op = op;
+        if self.use_send_for_imm {
+            match &mut op {
+                GroupWriteOp::Scatter(op) => {
+                    if let Some(imm_data) = op.imm_data.take() {
+                        imm_after_write = Some(
+                            addrs.iter()
+                                .copied()
+                                .skip(op.dst_beg)
+                                .take(op.dst_end - op.dst_beg)
+                                .map(|addr| (addr, imm_data))
+                                .collect(),
+                        );
+                    }
+                }
+            }
+        }
+        let op = self.normalize_remote_addr_group_write_op(op);
+        self.do_submit_write(transfer_id, imm_after_write, |rawctx, msg_buf| match op {
+            GroupWriteOp::Scatter(op) => WriteOpIter::Scatter(ScatterWriteOpIter::new(
+                op, addrs, msg_buf, rawctx,
+            )),
+        });
     }
 
     fn poll_progress(&mut self) {
