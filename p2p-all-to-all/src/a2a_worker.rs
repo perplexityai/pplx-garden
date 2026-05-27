@@ -360,6 +360,10 @@ impl WorkerState {
         self.err_counter.load(Ordering::Relaxed) != 0
     }
 
+    fn wait_imm(&self, counter: &ImmCounter, target: u32) -> bool {
+        counter.wait_while(target, || self.is_running())
+    }
+
     fn step(&self) {
         // Wait for the device to copy the routing info to the host.
         self.dispatch_route_done.wait();
@@ -388,7 +392,9 @@ impl WorkerState {
 
         // Wait for the routing information to arrive and aggregate it.
         let num_dp_groups = (self.world_size / self.dp_size) as u32;
-        self.route_counter.wait(num_dp_groups - 1);
+        if !self.wait_imm(&self.route_counter, num_dp_groups - 1) {
+            return;
+        }
         let route = self.process_routing_info();
 
         // Register a callback to wait for the expected number of immediates.
@@ -428,11 +434,13 @@ impl WorkerState {
 
             range_end!(dispatch_range);
         }
-        self.barrier(
+        if !self.barrier(
             self.dispatch_barrier_write_op.clone(),
             &self.dispatch_barrier_counter,
             num_dispatch_tx,
-        );
+        ) {
+            return;
+        }
 
         // Combine stage.
         {
@@ -461,7 +469,9 @@ impl WorkerState {
             }
 
             // Wait for all remote writes to complete.
-            self.combine_counter.wait(num_combine_imm);
+            if !self.wait_imm(&self.combine_counter, num_combine_imm) {
+                return;
+            }
             self.combine_recv_flag.set(true);
 
             // Let the recv phase output the tokens and proceed forward.
@@ -470,11 +480,13 @@ impl WorkerState {
             range_end!(combine_range);
         }
 
-        self.barrier(
+        if !self.barrier(
             self.combine_barrier_write_op.clone(),
             &self.combine_barrier_counter,
             num_combine_tx,
-        );
+        ) {
+            return;
+        }
     }
 
     fn dispatch_initial_routes(&self) -> usize {
@@ -798,7 +810,12 @@ impl WorkerState {
         }
     }
 
-    fn barrier(&self, request: TransferRequest, imm_counter: &ImmCounter, num_tx: u32) {
+    fn barrier(
+        &self,
+        request: TransferRequest,
+        imm_counter: &ImmCounter,
+        num_tx: u32,
+    ) -> bool {
         let barrier = range_start!("barrier");
 
         self.transfer_engine
@@ -810,18 +827,26 @@ impl WorkerState {
             .unwrap();
 
         // Wait for all payloads to be received.
-        imm_counter.wait((self.world_size - 1) as u32);
+        if !self.wait_imm(imm_counter, (self.world_size - 1) as u32) {
+            range_end!(barrier);
+            return false;
+        }
 
         // Wait for the sends to complete.
         let old = self.tx_counter.fetch_sub(num_tx as i64, Ordering::Relaxed);
         if old < num_tx as i64 {
             while self.tx_counter.load(Ordering::Relaxed) < 0 {
+                if !self.is_running() {
+                    range_end!(barrier);
+                    return false;
+                }
                 std::thread::yield_now();
             }
         }
         self.tx_ready.set(true);
 
         range_end!(barrier);
+        true
     }
 }
 

@@ -214,6 +214,23 @@ impl ImmCounter {
             std::hint::spin_loop();
         }
     }
+
+    pub fn wait_while<F>(&self, target: u32, keep_waiting: F) -> bool
+    where
+        F: Fn() -> bool,
+    {
+        let old = self.counter.fetch_sub(target as i64, Ordering::Relaxed);
+        if old >= target as i64 {
+            return true;
+        }
+        while self.counter.load(Ordering::Relaxed) < 0 {
+            if !keep_waiting() {
+                return false;
+            }
+            std::hint::spin_loop();
+        }
+        true
+    }
 }
 
 /// An immediate counter that sets a flag via GdrCopy.
