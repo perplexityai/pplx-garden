@@ -3,6 +3,7 @@ members = [
   "fabric-lib",
   "fabric-lib/fabric-debug",
   "p2p-all-to-all",
+  "pplx-unigram",
   "python-ext",
   "rust/build-utils",
   "rust/cuda-lib",
