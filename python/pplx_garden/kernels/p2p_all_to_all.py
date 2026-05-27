@@ -47,6 +47,69 @@ class _NVLRankMapping:
     recv_mapping: CUMemMapping
 
 
+@dataclass
+class P2PDispatchHandle:
+    kernel: "P2PAllToAll"
+    out_expert_num_tokens: torch.Tensor
+    out_expert_x: torch.Tensor
+    out_expert_x_scale: Optional[torch.Tensor]
+    dp_x: torch.Tensor
+    dp_x_scale: Optional[torch.Tensor]
+    indices: torch.Tensor
+    weights: torch.Tensor
+    bound_m: Optional[torch.Tensor]
+    send_done_event: torch.cuda.Event
+    recv_done: bool = False
+
+    def recv(self) -> None:
+        if self.recv_done:
+            return
+        torch.cuda.current_stream(self.dp_x.device).wait_event(self.send_done_event)
+        self.kernel.dispatch(
+            out_expert_num_tokens=self.out_expert_num_tokens,
+            out_expert_x=self.out_expert_x,
+            out_expert_x_scale=self.out_expert_x_scale,
+            dp_x=self.dp_x,
+            dp_x_scale=self.dp_x_scale,
+            indices=self.indices,
+            weights=self.weights,
+            bound_m=self.bound_m,
+            do_send=False,
+            do_recv=True,
+        )
+        self.recv_done = True
+
+
+@dataclass
+class P2PCombineHandle:
+    kernel: "P2PAllToAll"
+    dispatch_handle: P2PDispatchHandle
+    out_tokens: torch.Tensor
+    expert_y: torch.Tensor
+    bound_m: Optional[torch.Tensor]
+    accumulate: bool
+    send_done_event: torch.cuda.Event
+    recv_done: bool = False
+
+    def recv(self) -> None:
+        if self.recv_done:
+            return
+        torch.cuda.current_stream(self.out_tokens.device).wait_event(
+            self.send_done_event
+        )
+        self.kernel.combine(
+            out_tokens=self.out_tokens,
+            indices=self.dispatch_handle.indices,
+            weights=self.dispatch_handle.weights,
+            expert_y=self.expert_y,
+            bound_m=self.bound_m,
+            do_send=False,
+            do_recv=True,
+            accumulate=self.accumulate,
+        )
+        self.recv_done = True
+
+
 class P2PAllToAll(AllToAllKernel):
     def __init__(
         self,
@@ -461,6 +524,45 @@ class P2PAllToAll(AllToAllKernel):
                 stream=stream,
             )
 
+    def dispatch_async(
+        self,
+        *,
+        out_expert_num_tokens: torch.Tensor,
+        out_expert_x: torch.Tensor,
+        out_expert_x_scale: Optional[torch.Tensor],
+        dp_x: torch.Tensor,
+        dp_x_scale: Optional[torch.Tensor],
+        indices: torch.Tensor,
+        weights: torch.Tensor,
+        bound_m: Optional[torch.Tensor] = None,
+    ) -> P2PDispatchHandle:
+        self.dispatch(
+            out_expert_num_tokens=out_expert_num_tokens,
+            out_expert_x=out_expert_x,
+            out_expert_x_scale=out_expert_x_scale,
+            dp_x=dp_x,
+            dp_x_scale=dp_x_scale,
+            indices=indices,
+            weights=weights,
+            bound_m=bound_m,
+            do_send=True,
+            do_recv=False,
+        )
+        send_done_event = torch.cuda.Event()
+        send_done_event.record(torch.cuda.current_stream(dp_x.device))
+        return P2PDispatchHandle(
+            kernel=self,
+            out_expert_num_tokens=out_expert_num_tokens,
+            out_expert_x=out_expert_x,
+            out_expert_x_scale=out_expert_x_scale,
+            dp_x=dp_x,
+            dp_x_scale=dp_x_scale,
+            indices=indices,
+            weights=weights,
+            bound_m=bound_m,
+            send_done_event=send_done_event,
+        )
+
     @override
     def combine(
         self,
@@ -537,6 +639,37 @@ class P2PAllToAll(AllToAllKernel):
                 accumulate=accumulate,
                 stream=stream,
             )
+
+    def combine_async(
+        self,
+        *,
+        out_tokens: torch.Tensor,
+        dispatch_handle: P2PDispatchHandle,
+        expert_y: torch.Tensor,
+        bound_m: Optional[torch.Tensor] = None,
+        accumulate: bool = False,
+    ) -> P2PCombineHandle:
+        self.combine(
+            out_tokens=out_tokens,
+            indices=dispatch_handle.indices,
+            weights=dispatch_handle.weights,
+            expert_y=expert_y,
+            bound_m=bound_m,
+            do_send=True,
+            do_recv=False,
+            accumulate=accumulate,
+        )
+        send_done_event = torch.cuda.Event()
+        send_done_event.record(torch.cuda.current_stream(out_tokens.device))
+        return P2PCombineHandle(
+            kernel=self,
+            dispatch_handle=dispatch_handle,
+            out_tokens=out_tokens,
+            expert_y=expert_y,
+            bound_m=bound_m,
+            accumulate=accumulate,
+            send_done_event=send_done_event,
+        )
 
     @override
     def destroy(self) -> None:
