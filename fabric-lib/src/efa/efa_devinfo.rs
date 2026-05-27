@@ -72,6 +72,7 @@ pub fn get_efa_domains() -> Result<Vec<EfaDomainInfo>> {
             .ok_or_else(|| LibfabricError::new(FI_ENOMEM as i32, "fi_dupinfo"))?;
         let h = hints.as_mut();
         let provider_name = std::env::var("PPLX_GARDEN_LIBFABRIC_PROVIDER")
+            .or_else(|_| std::env::var("FI_PROVIDER"))
             .unwrap_or_else(|_| "efa".to_string());
         let is_efa = provider_name == "efa";
         h.caps = if is_efa {

@@ -167,8 +167,9 @@ impl EfaDomain {
             let use_local_mr_desc = mr_mode & FI_MR_LOCAL as i32 != 0;
             let use_endpoint_mr = mr_mode & FI_MR_ENDPOINT as i32 != 0;
             let use_remote_virt_addr = mr_mode & FI_MR_VIRT_ADDR as i32 != 0;
-            let use_send_for_imm = provider_name != "efa"
-                && std::env::var_os("PPLX_GARDEN_CXI_SEND_IMM_FALLBACK").is_some();
+            let use_send_for_imm = provider_name == "cxi"
+                || (provider_name != "efa"
+                    && std::env::var_os("PPLX_GARDEN_CXI_SEND_IMM_FALLBACK").is_some());
             let debug_fi = std::env::var_os("PPLX_GARDEN_DEBUG_FI").is_some();
             if debug_fi {
                 eprintln!(

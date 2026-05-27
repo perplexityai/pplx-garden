@@ -418,6 +418,10 @@ fn numa_topology_requested() -> bool {
     )
 }
 
+fn is_cxi_domain_name(name: &str) -> bool {
+    name.starts_with("hsn") || name.starts_with("cxi")
+}
+
 fn detect_numa_topo(
     all_gpus: &[&PciProp],
     all_nics: &[&PciProp],
@@ -474,6 +478,7 @@ fn detect_numa_topo(
 fn detect_system_topo(
     gpu_pci_device_id: PciDeviceId,
     nic_pci_device_id: PciDeviceId,
+    use_numa_topology: bool,
 ) -> Result<Vec<PciTopoGroup>> {
     struct PciSwitchGroup<'a> {
         gpus: Vec<&'a PciProp>,
@@ -506,7 +511,7 @@ fn detect_system_topo(
 
     // Get NUMA physical CPUs
     let numa_cpus = get_numa_physical_cpus()?;
-    if numa_topology_requested() {
+    if use_numa_topology {
         return Ok(detect_numa_topo(&all_gpus, &all_nics, &numa_cpus));
     }
 
@@ -546,10 +551,13 @@ fn detect_system_topo(
 fn get_visible_domains() -> Vec<DomainInfo> {
     // Try EFA first
     let mut efa_domains = get_efa_domains().unwrap_or_default();
-    if matches!(std::env::var("PPLX_GARDEN_LIBFABRIC_PROVIDER").as_deref(), Ok("cxi")) {
-        efa_domains.retain(|domain| {
-            domain.name().starts_with("hsn") || domain.name().starts_with("cxi")
-        });
+    if matches!(
+        std::env::var("PPLX_GARDEN_LIBFABRIC_PROVIDER")
+            .or_else(|_| std::env::var("FI_PROVIDER"))
+            .as_deref(),
+        Ok("cxi")
+    ) {
+        efa_domains.retain(|domain| is_cxi_domain_name(&domain.name()));
     }
     if !efa_domains.is_empty() {
         return efa_domains.into_iter().map(DomainInfo::Efa).collect();
@@ -593,7 +601,10 @@ fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
         .ok_or(FabricLibError::Custom("No visible NICs"))?;
 
     // Detect system topology
-    let system_topo = detect_system_topo(gpu_pci_device_id, nic_pci_device_id)?;
+    let use_numa_topology = numa_topology_requested()
+        || domains.iter().any(|domain| is_cxi_domain_name(&domain.name()));
+    let system_topo =
+        detect_system_topo(gpu_pci_device_id, nic_pci_device_id, use_numa_topology)?;
 
     // Only keep visible NICs and GPUs (e.g., due to containerization)
     let mut visible_nics = HashMap::new();
