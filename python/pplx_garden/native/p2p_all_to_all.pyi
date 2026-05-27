@@ -21,6 +21,7 @@ class AllToAllContext:
         scale_elemsize: int | None,
         max_num_tokens: int,
         max_recv_tokens: int,
+        max_tokens_per_expert: int | None,
         max_private_tokens: int,
         num_experts: int,
         expert_padding: int,

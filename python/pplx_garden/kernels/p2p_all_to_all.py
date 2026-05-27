@@ -132,6 +132,7 @@ class P2PAllToAll(AllToAllKernel):
         imm_base: int = 0x80000000,
         transfer_engine: Optional[TransferEngine] = None,
         worker_cpu: Optional[int] = None,
+        max_tokens_per_expert: Optional[int] = None,
     ) -> None:
         self._hidden_dim = hidden_dim
         self._hidden_dim_scale = hidden_dim_scale
@@ -141,6 +142,7 @@ class P2PAllToAll(AllToAllKernel):
         self._scale_dtype = scale_dtype
         self._device = device
         self._global_group = global_group
+        self._max_tokens_per_expert = max_tokens_per_expert
         self._handle_kind = CUMemHandleKind.FileDescriptor
 
         # Determine the number of local experts.
@@ -372,6 +374,7 @@ class P2PAllToAll(AllToAllKernel):
             scale_elemsize=scale_dtype.itemsize if scale_dtype else None,
             max_num_tokens=max_num_tokens,
             max_recv_tokens=max_recv_tokens,
+            max_tokens_per_expert=max_tokens_per_expert,
             max_private_tokens=max_private_tokens,
             num_experts=num_experts,
             expert_padding=expert_padding,
@@ -425,10 +428,12 @@ class P2PAllToAll(AllToAllKernel):
         out_expert_num_tokens_ptr = out_expert_num_tokens.data_ptr()
 
         # Verify the output token buffer.
-        num_expert_tokens, _ = out_expert_x.shape
-        assert out_expert_x.shape == (num_expert_tokens, self._hidden_dim)
-        assert out_expert_x.stride(1) == 1
-        assert out_expert_x.dtype == self._in_dtype
+        out_expert_x = self._flatten_batched_experts(
+            out_expert_x,
+            dtype=self._in_dtype,
+            hidden_dim=self._hidden_dim,
+            name="out_expert_x",
+        )
         out_x_ptr = out_expert_x.data_ptr()
         out_x_stride = out_expert_x.stride(0) * out_expert_x.dtype.itemsize
 
@@ -437,6 +442,14 @@ class P2PAllToAll(AllToAllKernel):
         out_x_scale_stride_elem: Optional[int]
         out_x_scale_stride_token: Optional[int]
         if out_expert_x_scale is not None:
+            assert self._scale_dtype is not None
+            assert self._hidden_dim_scale is not None
+            out_expert_x_scale = self._flatten_batched_experts(
+                out_expert_x_scale,
+                dtype=self._scale_dtype,
+                hidden_dim=self._hidden_dim_scale,
+                name="out_expert_x_scale",
+            )
             assert out_expert_x_scale.dtype == self._scale_dtype
             out_x_scale_ptr = out_expert_x_scale.data_ptr()
             out_x_scale_stride_elem = out_expert_x_scale.stride(1)
@@ -524,6 +537,32 @@ class P2PAllToAll(AllToAllKernel):
                 stream=stream,
             )
 
+    def _flatten_batched_experts(
+        self,
+        tensor: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+        hidden_dim: int,
+        name: str,
+    ) -> torch.Tensor:
+        if tensor.ndim == 2:
+            num_expert_tokens, _ = tensor.shape
+            assert tensor.shape == (num_expert_tokens, hidden_dim)
+            assert tensor.stride(1) == 1
+            assert tensor.dtype == dtype
+            return tensor
+
+        assert self._max_tokens_per_expert is not None
+        assert tensor.ndim == 3
+        assert tensor.shape == (
+            self._num_local_experts,
+            self._max_tokens_per_expert,
+            hidden_dim,
+        ), f"{name} has unexpected shape {tuple(tensor.shape)}"
+        assert tensor.stride(2) == 1
+        assert tensor.dtype == dtype
+        return tensor.reshape(-1, hidden_dim)
+
     def dispatch_async(
         self,
         *,
@@ -582,6 +621,12 @@ class P2PAllToAll(AllToAllKernel):
         assert not accumulate or self._dp_size == 1
 
         num_tokens, _ = indices.shape
+        expert_y = self._flatten_batched_experts(
+            expert_y,
+            dtype=expert_y.dtype,
+            hidden_dim=self._hidden_dim,
+            name="expert_y",
+        )
         num_recv_tokens, _ = expert_y.shape
 
         assert out_tokens.shape == (num_tokens, self._hidden_dim)
@@ -603,7 +648,6 @@ class P2PAllToAll(AllToAllKernel):
         weights_stride = weights.stride(0)
 
         assert expert_y.shape == (num_recv_tokens, self._hidden_dim)
-        assert expert_y.stride(1) == 1
         expert_y_ptr = expert_y.data_ptr()
         expert_y_stride = expert_y.stride(0) * expert_y.dtype.itemsize
 

@@ -37,6 +37,7 @@ pub(crate) struct WorkerState {
     transfer_engine: Arc<TransferEngine>,
     max_num_tokens: usize,
     max_recv_tokens: usize,
+    max_tokens_per_expert: usize,
     max_private_tokens: usize,
     hidden_dim: usize,
     hidden_dim_scale: usize,
@@ -108,6 +109,7 @@ impl WorkerState {
         scale_elemsize: usize,
         max_num_tokens: usize,
         max_recv_tokens: usize,
+        max_tokens_per_expert: usize,
         max_private_tokens: usize,
         num_experts: usize,
         expert_padding: usize,
@@ -235,6 +237,7 @@ impl WorkerState {
             transfer_engine: transfer_engine.clone(),
             max_num_tokens,
             max_recv_tokens,
+            max_tokens_per_expert,
             max_private_tokens,
             hidden_dim,
             hidden_dim_scale,
@@ -595,14 +598,21 @@ impl WorkerState {
         }
         self.tokens_per_expert.copy(&tokens_per_expert);
 
-        // Pad the per-expert counts.
+        // Compute the output row base for each local expert. In the default compact
+        // layout, experts are tightly packed with optional padding. In batched
+        // layout, each expert gets a fixed row stride so callers can view the
+        // output as [num_local_experts, max_tokens_per_expert, hidden].
         let mut padded_offset = Vec::with_capacity(num_local_experts);
         let mut base_expert_offset = 0;
-        for count in &tokens_per_expert {
-            let padded_count =
-                (*count as usize).div_ceil(self.expert_padding) * self.expert_padding;
-            padded_offset.push(base_expert_offset);
-            base_expert_offset += padded_count as u32;
+        for (local_expert, count) in tokens_per_expert.iter().enumerate() {
+            if self.max_tokens_per_expert > 0 {
+                padded_offset.push((local_expert * self.max_tokens_per_expert) as u32);
+            } else {
+                let padded_count = (*count as usize).div_ceil(self.expert_padding)
+                    * self.expert_padding;
+                padded_offset.push(base_expert_offset);
+                base_expert_offset += padded_count as u32;
+            }
         }
 
         // Find individual shuffled indices on the local rank.
