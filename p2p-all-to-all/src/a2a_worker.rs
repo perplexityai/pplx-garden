@@ -403,7 +403,9 @@ impl WorkerState {
             + if num_private_ranges == 0 { 0 } else { 1 }
             + if route.dispatch_ranges.is_empty() { 0 } else { 1 };
         let num_combine_tx = 1 + if self.world_size > self.node_size { 1 } else { 0 };
-        let num_combine_imm = (self.world_size - self.node_size) as u32 * num_shards;
+        let num_remote_nodes = self.world_size / self.node_size - 1;
+        let groups_per_node = self.node_size / self.dp_size;
+        let num_combine_imm = (num_remote_nodes * groups_per_node) as u32 * num_shards;
 
         // Dispatch stage.
         {
@@ -516,7 +518,7 @@ impl WorkerState {
         }
 
         for peer_node in 1..(self.world_size / self.node_size) {
-            for index in 0..self.node_size {
+            for index in (self.dp_rank..self.node_size).step_by(self.dp_size) {
                 let peer_rank = ((rank_node + peer_node) * self.node_size + index)
                     % self.world_size;
                 let num_tokens =
@@ -779,25 +781,23 @@ impl WorkerState {
             for index in 0..(self.node_size / self.dp_size) {
                 let peer_group =
                     ((rank_node + peer_node) * groups_per_node + index) % num_dp_groups;
-                for index in 0..self.dp_size {
-                    let token_dim = self.get_combine_token_dim();
+                let token_dim = self.get_combine_token_dim();
 
-                    let peer_rank = peer_group * self.dp_size + index;
-                    let length = token_dim * tokens_from_group[peer_group] as usize;
+                let peer_rank = peer_group * self.dp_size + self.dp_rank;
+                let length = token_dim * tokens_from_group[peer_group] as usize;
 
-                    let src_offset =
-                        src_group_offset[peer_group] as u64 * token_dim as u64;
-                    let dst_offset =
-                        dst_group_offset[peer_group] as u64 * token_dim as u64;
+                let src_offset =
+                    src_group_offset[peer_group] as u64 * token_dim as u64;
+                let dst_offset =
+                    dst_group_offset[peer_group] as u64 * token_dim as u64;
 
-                    let dst_mr = self.rank_handles[peer_rank].recv_buffer_desc.clone();
-                    combine_ranges.push(ScatterTarget {
-                        length: length as u64,
-                        src_offset,
-                        dst_offset,
-                        dst_mr,
-                    });
-                }
+                let dst_mr = self.rank_handles[peer_rank].recv_buffer_desc.clone();
+                combine_ranges.push(ScatterTarget {
+                    length: length as u64,
+                    src_offset,
+                    dst_offset,
+                    dst_mr,
+                });
             }
         }
 

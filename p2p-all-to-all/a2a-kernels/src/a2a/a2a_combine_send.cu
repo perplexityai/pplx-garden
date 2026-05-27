@@ -194,14 +194,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
                 auto token_rank = local_stages[s].rank;
                 auto token_node = token_rank / NODE_SIZE;
                 if (token_node == rank_node) {
-                    unsigned first_peer = (token_rank / DP_SIZE) * DP_SIZE;
-                    // Copy the token into the recv buffer of the receiving node via NVLink.
-                    #pragma unroll(DP_SIZE)
-                    for (unsigned dp_peer = 0; dp_peer < DP_SIZE; dp_peer++) {
-                        auto token_peer = (first_peer + dp_peer) % NODE_SIZE;
-                        auto *x_token_dst = (uint4*)(recv_ptrs_local[token_peer] + offset * token_bound);
-                        st_global_nc_uint4(&x_token_dst[i], values[s]);
-                    }
+                    auto token_peer = token_rank % NODE_SIZE;
+                    auto *x_token_dst = (uint4*)(recv_ptrs_local[token_peer] + offset * token_bound);
+                    st_global_nc_uint4(&x_token_dst[i], values[s]);
                 }
             }
         }
