@@ -2,6 +2,7 @@ mod py_cumem;
 mod py_device;
 mod py_fabric_lib;
 mod py_p2p_all_to_all;
+mod py_unigram;
 
 use pyo3::{Bound, PyResult, pymodule, types::PyModule};
 
@@ -16,6 +17,7 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     py_cumem::init(m)?;
     py_p2p_all_to_all::init(m)?;
     py_fabric_lib::init(m)?;
+    py_unigram::init(m)?;
 
     Ok(())
 }
