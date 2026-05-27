@@ -13,4 +13,7 @@ def count_sys_infiniband_verbs() -> int:
 
 
 def get_nets_per_gpu() -> int:
-    return count_sys_infiniband_verbs() // count_sys_nvidia()
+    num_gpus = count_sys_nvidia()
+    if num_gpus == 0:
+        return 0
+    return count_sys_infiniband_verbs() // num_gpus
