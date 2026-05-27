@@ -21,6 +21,7 @@ cuda-lib = { path = "rust/cuda-lib" }
 fabric-lib = { path = "fabric-lib" }
 logging-lib = { path = "rust/logging-lib" }
 p2p-all-to-all = { path = "p2p-all-to-all" }
+pplx-unigram = { path = "pplx-unigram" }
 proc-lib = { path = "rust/proc-lib" }
 thread-lib = { path = "rust/thread-lib" }
 torch-lib = { path = "rust/torch-lib" }
