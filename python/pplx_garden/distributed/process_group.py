@@ -158,7 +158,7 @@ def _parallel_worker(
     if setup_logging_level is not None:
         logging_utils.setup(level=setup_logging_level)
 
-    device = torch.device(devices[local_rank])
+    device = torch.device(f"cuda:{devices[local_rank]}")
 
     process_group = ProcessGroup(
         init_method=init_method,
@@ -240,7 +240,7 @@ def _parallel_launch(
     if config.world_size == 1:
         # No TP, call the worker directly.
         ret = worker(
-            torch.device(devices[0]),
+            torch.device(f"cuda:{devices[0]}"),
             None,
             None,
             *args,

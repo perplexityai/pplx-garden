@@ -66,6 +66,9 @@ class P2PAllToAll(AllToAllKernel):
         dp_group: Optional[ParallelGroup],
         node_group: Optional[ParallelGroup],
         global_group: ParallelGroup,
+        imm_base: int = 0x80000000,
+        transfer_engine: Optional[TransferEngine] = None,
+        worker_cpu: Optional[int] = None,
     ) -> None:
         self._hidden_dim = hidden_dim
         self._hidden_dim_scale = hidden_dim_scale
@@ -122,22 +125,41 @@ class P2PAllToAll(AllToAllKernel):
         device_groups = [
             group for group in system_topo if group.cuda_device == device.index
         ]
-        if len(device_groups) != 1:
-            msg = f"Cannot identify topology group for cuda:{device.index}"
+        if len(device_groups) == 1:
+            group = device_groups[0]
+        elif device.index is not None and 0 <= device.index < len(system_topo):
+            group = system_topo[device.index]
+            logger.warning(
+                "Falling back to topology group %s for cuda:%s; detected CUDA groups are %s",
+                device.index,
+                device.index,
+                [group.cuda_device for group in system_topo],
+            )
+        else:
+            msg = (
+                f"Cannot identify topology group for cuda:{device.index}; "
+                f"detected CUDA groups are {[group.cuda_device for group in system_topo]}"
+            )
             raise RuntimeError(msg)
-        group = device_groups[0]
 
         if len(group.cpus) < 2:
             msg = f"Not enough CPUs in device group for cuda:{device.index}"
             raise RuntimeError(msg)
 
-        worker_cpu, domain_cpu, uvm_cpu, *_ = group.cpus
+        default_worker_cpu, domain_cpu, uvm_cpu, *_ = group.cpus
+        if worker_cpu is None:
+            worker_cpu = default_worker_cpu
         domains = group.domains[:nets_per_gpu]
 
-        # Build the transfer engine.
-        builder = TransferEngine.builder()
-        builder.add_gpu_domains(device.index, domains, domain_cpu, uvm_cpu)
-        self._transfer_engine = builder.build()
+        # Build or reuse the transfer engine. Multiple live P2PAllToAll contexts
+        # should not each spawn their own fabric workers for the same GPU/NIC
+        # resources; that path is extremely slow on the CXI backend.
+        self._owns_transfer_engine = transfer_engine is None
+        if transfer_engine is None:
+            builder = TransferEngine.builder()
+            builder.add_gpu_domains(group.cuda_device, domains, domain_cpu, uvm_cpu)
+            transfer_engine = builder.build()
+        self._transfer_engine = transfer_engine
 
         # Allocate and register a buffer for per-expert routed counts on the host.
         self._num_routed_buffer = torch.empty(
@@ -305,7 +327,7 @@ class P2PAllToAll(AllToAllKernel):
             send_ptrs=send_ptrs,
             recv_ptrs=recv_ptrs,
             device=device.index,
-            imm_base=0x80000000,
+            imm_base=imm_base,
             ranks=ranks,
             transfer_engine=self._transfer_engine,
             worker_cpu=worker_cpu,
@@ -528,7 +550,7 @@ class P2PAllToAll(AllToAllKernel):
 
         # Stop the transfer engine once no rank is active.
         self._global_group.barrier()
-        if self._transfer_engine is not None:
+        if self._transfer_engine is not None and self._owns_transfer_engine:
             self._transfer_engine.stop()
             del self._transfer_engine
             self._transfer_engine = None

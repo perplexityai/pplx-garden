@@ -86,16 +86,16 @@ impl From<&EfaDomainInfo> for PciAddress {
     fn from(domain: &EfaDomainInfo) -> Self {
         let fi_ref = unsafe { domain.fi().as_ref() };
         if unsafe { fi_ref.nic.as_ref() }.is_none() {
-            let name = unsafe {
-                CStr::from_ptr((*fi_ref.domain_attr).name).to_string_lossy()
-            };
+            let name =
+                unsafe { CStr::from_ptr((*fi_ref.domain_attr).name).to_string_lossy() };
             let cxi_name = name
                 .strip_prefix("hsn")
                 .map(|index| format!("cxi{index}"))
                 .or_else(|| name.strip_prefix("cxi").map(|index| format!("cxi{index}")))
                 .expect("NIC is null and CXI domain name is not hsnN/cxiN");
-            let device_path = std::fs::read_link(format!("/sys/class/cxi/{cxi_name}/device"))
-                .expect("NIC is null and CXI sysfs device link is unavailable");
+            let device_path =
+                std::fs::read_link(format!("/sys/class/cxi/{cxi_name}/device"))
+                    .expect("NIC is null and CXI sysfs device link is unavailable");
             let pci_addr = device_path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -546,12 +546,10 @@ fn detect_system_topo(
 fn get_visible_domains() -> Vec<DomainInfo> {
     // Try EFA first
     let mut efa_domains = get_efa_domains().unwrap_or_default();
-    if matches!(
-        std::env::var("PPLX_GARDEN_LIBFABRIC_PROVIDER").as_deref(),
-        Ok("cxi")
-    ) {
-        efa_domains
-            .retain(|domain| domain.name().starts_with("hsn") || domain.name().starts_with("cxi"));
+    if matches!(std::env::var("PPLX_GARDEN_LIBFABRIC_PROVIDER").as_deref(), Ok("cxi")) {
+        efa_domains.retain(|domain| {
+            domain.name().starts_with("hsn") || domain.name().starts_with("cxi")
+        });
     }
     if !efa_domains.is_empty() {
         return efa_domains.into_iter().map(DomainInfo::Efa).collect();

@@ -5,11 +5,9 @@ use std::{
 };
 
 use libfabric_sys::{
-    FI_ENOMEM,
-    FI_EP_RDM, FI_HMEM, FI_LOCAL_COMM, FI_MR_ALLOCATED, FI_MR_HMEM,
-    FI_MR_LOCAL, FI_MR_PROV_KEY, FI_MR_VIRT_ADDR, FI_MSG, FI_REMOTE_COMM,
-    FI_RMA, FI_THREAD_DOMAIN, fi_dupinfo, fi_freeinfo, fi_getinfo, fi_info,
-    make_fi_version,
+    FI_ENOMEM, FI_EP_RDM, FI_HMEM, FI_LOCAL_COMM, FI_MR_ALLOCATED, FI_MR_HMEM,
+    FI_MR_LOCAL, FI_MR_PROV_KEY, FI_MR_VIRT_ADDR, FI_MSG, FI_REMOTE_COMM, FI_RMA,
+    FI_THREAD_DOMAIN, fi_dupinfo, fi_freeinfo, fi_getinfo, fi_info, make_fi_version,
 };
 
 use crate::{
