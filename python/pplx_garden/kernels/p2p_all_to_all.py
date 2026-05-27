@@ -158,7 +158,7 @@ class P2PAllToAll(AllToAllKernel):
         rank = global_group.rank
         world_size = global_group.size
         num_dp_groups = world_size // self._dp_size
-        self._num_local_experts = ceil_div(num_experts, world_size)
+        self._num_local_experts = ceil_div(num_experts, num_dp_groups)
 
         # Determine the size of the recv buffers.
         avg_tokens_per_expert = int(

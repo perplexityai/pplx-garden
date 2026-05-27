@@ -356,6 +356,7 @@ impl AllToAllContext {
             self.scale_elemsize,
             self.num_experts,
             self.rank,
+            self.dp_size,
             self.node_size,
             self.world_size,
             out_num_tokens_ptr,

@@ -151,7 +151,7 @@ impl WorkerState {
     ) -> Result<Self> {
         let dp_rank = rank % dp_size;
         let dp_group = rank / dp_size;
-        let num_local_experts = num_experts.div_ceil(world_size);
+        let num_local_experts = num_experts.div_ceil(world_size / dp_size);
 
         let gdr_context = GdrCopyContext::new()?;
 
@@ -492,17 +492,18 @@ impl WorkerState {
     fn dispatch_initial_routes(&self) -> usize {
         let mut dsts: Vec<ScatterTarget> = Vec::with_capacity(self.world_size - 1);
 
-        let experts_per_rank = self.num_experts.div_ceil(self.world_size);
+        let experts_per_rank =
+            self.num_experts.div_ceil(self.world_size / self.dp_size);
         let token_dim = self.get_dispatch_token_dim();
         let rank_node = self.rank / self.node_size;
 
         let mut tokens_per_rank = vec![0; self.world_size];
         let mut rank_offset = vec![0; self.world_size];
         let mut offset = 0;
-        for peer_rank in 0..self.world_size {
-            let first_expert = peer_rank * experts_per_rank;
-            let last_expert =
-                ((peer_rank + 1) * experts_per_rank).min(self.num_experts);
+        for peer_group in 0..(self.world_size / self.dp_size) {
+            let peer_rank = peer_group * self.dp_size + self.dp_rank;
+            let first_expert = peer_group * experts_per_rank;
+            let last_expert = (first_expert + experts_per_rank).min(self.num_experts);
 
             let mut tokens_on_rank = 0;
             for expert in first_expert..last_expert {
@@ -563,8 +564,8 @@ impl WorkerState {
         let process_routing_info_range = range_start!("process_routing_info");
 
         let num_dp_groups = self.world_size / self.dp_size;
-        let experts_per_rank = self.num_experts.div_ceil(self.world_size);
-        let first_local_expert = self.rank * experts_per_rank;
+        let experts_per_rank = self.num_experts.div_ceil(num_dp_groups);
+        let first_local_expert = self.dp_group * experts_per_rank;
         let last_local_expert =
             (first_local_expert + experts_per_rank).min(self.num_experts);
         let num_local_experts = last_local_expert - first_local_expert;
@@ -588,19 +589,17 @@ impl WorkerState {
             for dp_group in 0..num_dp_groups {
                 let group_node = dp_group / groups_per_node;
                 let mut num_tokens = 0usize;
-                for i in 0..self.dp_size {
-                    let rank = dp_group * self.dp_size + i;
-                    dispatch_src_offset[rank] = rank_offset;
+                let rank = dp_group * self.dp_size + self.dp_rank;
+                dispatch_src_offset[rank] = rank_offset;
 
-                    let first_expert = rank * experts_per_rank;
-                    let last_expert =
-                        (first_expert + experts_per_rank).min(self.num_experts);
-                    for expert in first_expert..last_expert {
-                        let n = self.get_num_routed(self.dp_group, expert);
-                        source_expert_offset[expert] = rank_offset;
-                        tokens_to_rank[rank] += n;
-                        rank_offset += n;
-                    }
+                let first_expert = dp_group * experts_per_rank;
+                let last_expert =
+                    (first_expert + experts_per_rank).min(self.num_experts);
+                for expert in first_expert..last_expert {
+                    let n = self.get_num_routed(self.dp_group, expert);
+                    source_expert_offset[expert] = rank_offset;
+                    tokens_to_rank[rank] += n;
+                    rank_offset += n;
                 }
 
                 let mut offset = 0;
@@ -749,9 +748,10 @@ impl WorkerState {
                     continue;
                 }
 
-                let first_expert = peer_rank * experts_per_rank;
+                let peer_group = peer_rank / self.dp_size;
+                let first_expert = peer_group * experts_per_rank;
                 let last_expert =
-                    ((peer_rank + 1) * experts_per_rank).min(self.num_experts);
+                    (first_expert + experts_per_rank).min(self.num_experts);
 
                 let mut dst_offset = 0;
                 for src_group in 0..self.dp_group {

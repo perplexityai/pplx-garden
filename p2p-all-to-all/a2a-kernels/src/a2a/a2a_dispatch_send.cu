@@ -52,8 +52,8 @@ public:
         const float weight = weights_[token_ * weights_stride_ + i];
         const uint32_t offset = token_offset_[token_ * num_experts_per_token_ + i];
         const uint32_t position = (expert > 0 ? expert_offsets_[expert - 1] : 0) + offset;
-        const uint32_t dst_rank = expert / experts_per_rank;
-        const uint32_t rank_offset = dst_rank > 0 ? expert_offsets_[dst_rank * experts_per_rank - 1] : 0;
+        const uint32_t dst_expert_rank = expert / experts_per_rank;
+        const uint32_t rank_offset = dst_expert_rank > 0 ? expert_offsets_[dst_expert_rank * experts_per_rank - 1] : 0;
         return {expert, position - rank_offset, position, weight};
     }
 
@@ -89,8 +89,8 @@ public:
             const auto weight = weights[token * weights_stride + i];
             const auto offset = token_offset[token * N + i];
             const uint32_t position = (expert > 0 ? expert_offsets[expert - 1] : 0) + offset;
-            const uint32_t dst_rank = expert / experts_per_rank;
-            const uint32_t rank_offset = dst_rank > 0 ? expert_offsets[dst_rank * experts_per_rank - 1] : 0;
+            const uint32_t dst_expert_rank = expert / experts_per_rank;
+            const uint32_t rank_offset = dst_expert_rank > 0 ? expert_offsets[dst_expert_rank * experts_per_rank - 1] : 0;
             experts_[i] = expert;
             weights_[i] = weight;
             offsets_[i] = position - rank_offset;
@@ -165,8 +165,10 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
     const size_t node_rank = rank / NODE_SIZE;
     const size_t node_group = rank / dp_size;
     const size_t dp_group = rank / dp_size;
-    const size_t experts_per_rank = ceil_div<size_t>(num_experts, world_size);
-    const size_t first_expert = rank * experts_per_rank;
+    const size_t expert_parallel_size = world_size / dp_size;
+    const size_t dp_rank = rank % dp_size;
+    const size_t experts_per_rank = ceil_div<size_t>(num_experts, expert_parallel_size);
+    const size_t first_expert = (rank / dp_size) * experts_per_rank;
     const size_t last_expert = min<size_t>(first_expert + experts_per_rank, num_experts);
 
     const size_t num_send_tokens = bound_m_ptr ? *bound_m_ptr : num_tokens;
@@ -180,13 +182,18 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
         }
         __syncthreads();
 
-        for (uint32_t i = threadIdx.x; i < num_send_tokens * num_experts_per_token_bound; i += blockDim.x) {
-            const uint32_t token = i / num_experts_per_token_bound;
-            const uint32_t index = i % num_experts_per_token_bound;
-            const uint32_t expert = __ldg(&indices[token * indices_stride + index]);
-
-            // Assign an offset to the token within the current rank and expert.
-            token_offset[i] = atomicAdd(&tokens_per_expert[expert], 1);
+        for (uint32_t expert = threadIdx.x; expert < num_experts; expert += blockDim.x) {
+            uint32_t count = 0;
+            for (uint32_t token = 0; token < num_send_tokens; ++token) {
+                #pragma unroll
+                for (uint32_t index = 0; index < num_experts_per_token_bound; ++index) {
+                    const uint32_t route = __ldg(&indices[token * indices_stride + index]);
+                    if (route == expert) {
+                        token_offset[token * num_experts_per_token_bound + index] = count++;
+                    }
+                }
+            }
+            tokens_per_expert[expert] = count;
         }
         __syncthreads();
 
@@ -296,7 +303,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                     #pragma unroll
                     for (unsigned e = 0; e < num_experts_per_token_bound; e++) {
                         auto route = expert_iterator[e];
-                        const uint32_t dst_rank = route.expert / experts_per_rank;
+                        const uint32_t dst_rank = (route.expert / experts_per_rank) * dp_size + dp_rank;
                         const uint32_t dst_node = dst_rank / NODE_SIZE;
 
                         // If the destination is within the same node, write using NVLink.
@@ -350,7 +357,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                 #pragma unroll
                 for (unsigned e = 0; e < num_experts_per_token_bound; e++) {
                     auto route = expert_iterator[e];
-                    const uint32_t dst_rank = route.expert / experts_per_rank;
+                    const uint32_t dst_rank = (route.expert / experts_per_rank) * dp_size + dp_rank;
                     const uint32_t dst_node = dst_rank / NODE_SIZE;
 
                     // If the destination is within the same node, write using NVLink.
@@ -383,7 +390,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                 #pragma unroll
                 for (unsigned e = 0; e < num_experts_per_token_bound; e++) {
                     auto route = expert_iterator[e];
-                    const uint32_t dst_rank = route.expert / experts_per_rank;
+                    const uint32_t dst_rank = (route.expert / experts_per_rank) * dp_size + dp_rank;
                     const uint32_t dst_node = dst_rank / NODE_SIZE;
 
                     // If the destination is within the same node, write using NVLink.
@@ -441,7 +448,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                 #pragma unroll
                 for (unsigned e = 0; e < num_experts_per_token_bound; e++) {
                     auto route = expert_iterator[e];
-                    const uint32_t dst_rank = route.expert / experts_per_rank;
+                    const uint32_t dst_rank = (route.expert / experts_per_rank) * dp_size + dp_rank;
                     const uint32_t dst_node = dst_rank / NODE_SIZE;
 
                     // If the destination is within the same node, write using NVLink.
@@ -500,7 +507,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                     #pragma unroll
                     for (unsigned e = 0; e < num_experts_per_token_bound; e++) {
                         auto route = expert_iterator[e];
-                        const uint32_t dst_rank = route.expert / experts_per_rank;
+                        const uint32_t dst_rank = (route.expert / experts_per_rank) * dp_size + dp_rank;
                         const uint32_t dst_node = dst_rank / NODE_SIZE;
 
                         // If the destination is within the same node, write using NVLink.

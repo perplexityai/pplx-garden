@@ -94,6 +94,7 @@ markers = [
     "distributed: marks tests which require multiple ranks or processes",
     "fabric: marks tests which require libfabric",
     "kernel: marks kernel tests (deselect with -m 'not kernel')",
+    "multinode: marks tests which require multiple launched nodes",
     "perf: marks performance and regression benchmarks",
 ]
 

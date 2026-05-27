@@ -54,6 +54,7 @@ mod ffi {
             x_scale_elemsize: usize,
             num_experts: usize,
             rank: usize,
+            dp_size: usize,
             node_size: usize,
             world_size: usize,
             out_num_tokens_ptr: *mut i32,

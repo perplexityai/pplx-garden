@@ -90,8 +90,8 @@ def _test_p2p_all_to_all_worker(
     out_dtype = config.out_dtype
     scale_dtype = config.scale_dtype
 
-    num_local_experts = num_experts // global_group.size
-    first_expert = global_group.rank * num_local_experts
+    num_local_experts = num_experts // num_dp_groups
+    first_expert = dp_rank * num_local_experts
     last_expert = min(first_expert + num_local_experts, num_experts)
 
     max_recv_tokens = max_num_tokens * num_local_experts * num_dp_groups
@@ -498,9 +498,9 @@ def _test_p2p_all_to_all_worker(
                 world_size=4,
                 dp_size=2,
                 nets_per_gpu=1,
-                max_num_tokens=1,
-                num_experts=4,
-                hidden_dim=8,
+                max_num_tokens=128,
+                num_experts=128,
+                hidden_dim=128,
                 hidden_dim_scale=None,
                 max_private_tokens=None,
                 num_experts_per_token=1,
@@ -514,7 +514,7 @@ def _test_p2p_all_to_all_worker(
                 mark_ci_4gpu,
                 pytest.mark.skipif(not has_tp(4), reason="Requires 4 devices"),
             ],
-            id="TP4-DP2-NIC1-BF16",
+            id="TP4-DP2-NIC1-BF16-TP-LANE-COLLISIONS",
         ),
         pytest.param(
             _Config(

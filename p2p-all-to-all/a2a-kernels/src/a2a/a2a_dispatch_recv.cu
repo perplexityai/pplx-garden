@@ -25,6 +25,7 @@ void a2a_dispatch_recv_kernel(
     size_t x_scale_elemsize,
     size_t num_experts,
     size_t rank,
+    size_t dp_size,
     size_t world_size,
     int32_t * __restrict__ out_num_tokens_ptr,
     std::byte * __restrict__ out_x_ptr,
@@ -84,8 +85,8 @@ void a2a_dispatch_recv_kernel(
     const unsigned warp_id = threadIdx.x / WARP_SIZE;
     const unsigned lane_id = get_lane_id();
 
-    const size_t experts_per_rank = ceil_div<size_t>(num_experts, world_size);
-    const size_t first_expert = rank * experts_per_rank;
+    const size_t experts_per_rank = ceil_div<size_t>(num_experts, world_size / dp_size);
+    const size_t first_expert = (rank / dp_size) * experts_per_rank;
     const size_t last_expert = min<size_t>(first_expert + experts_per_rank, num_experts);
 
     // Wait for NVLink transfers to complete.
@@ -244,6 +245,7 @@ int a2a_kernels::a2a_dispatch_recv(
     size_t x_scale_elemsize,
     size_t num_experts,
     size_t rank,
+    size_t dp_size,
     size_t node_size,
     size_t world_size,
     int32_t *out_num_tokens_ptr,
@@ -289,6 +291,7 @@ int a2a_kernels::a2a_dispatch_recv(
         &x_scale_elemsize,
         &num_experts,
         &rank,
+        &dp_size,
         &world_size,
         &out_num_tokens_ptr,
         &out_x_ptr,

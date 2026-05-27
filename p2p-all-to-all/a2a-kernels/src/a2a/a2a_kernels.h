@@ -60,6 +60,7 @@ int a2a_dispatch_recv(
     size_t x_scale_elemsize,
     size_t num_experts,
     size_t rank,
+    size_t dp_size,
     size_t node_size,
     size_t world_size,
     int32_t *out_num_tokens_ptr,
