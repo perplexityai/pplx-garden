@@ -23,6 +23,26 @@ use nvtx::{range_end, range_start};
 
 use crate::a2a_handles::AllToAllRankHandle;
 
+fn compute_padded_offsets(
+    tokens_per_expert: &[u32],
+    expert_padding: usize,
+    max_tokens_per_expert: usize,
+) -> Vec<u32> {
+    let mut padded_offset = Vec::with_capacity(tokens_per_expert.len());
+    let mut base_expert_offset = 0;
+    for (local_expert, count) in tokens_per_expert.iter().enumerate() {
+        if max_tokens_per_expert > 0 {
+            padded_offset.push((local_expert * max_tokens_per_expert) as u32);
+        } else {
+            let padded_count =
+                (*count as usize).div_ceil(expert_padding) * expert_padding;
+            padded_offset.push(base_expert_offset);
+            base_expert_offset += padded_count as u32;
+        }
+    }
+    padded_offset
+}
+
 pub(crate) struct WorkerBuffers {
     pub(crate) num_routed_ptr: *mut u32,
     pub(crate) send_buffer_ptr: *mut c_void,
@@ -602,18 +622,11 @@ impl WorkerState {
         // layout, experts are tightly packed with optional padding. In batched
         // layout, each expert gets a fixed row stride so callers can view the
         // output as [num_local_experts, max_tokens_per_expert, hidden].
-        let mut padded_offset = Vec::with_capacity(num_local_experts);
-        let mut base_expert_offset = 0;
-        for (local_expert, count) in tokens_per_expert.iter().enumerate() {
-            if self.max_tokens_per_expert > 0 {
-                padded_offset.push((local_expert * self.max_tokens_per_expert) as u32);
-            } else {
-                let padded_count = (*count as usize).div_ceil(self.expert_padding)
-                    * self.expert_padding;
-                padded_offset.push(base_expert_offset);
-                base_expert_offset += padded_count as u32;
-            }
-        }
+        let padded_offset = compute_padded_offsets(
+            &tokens_per_expert,
+            self.expert_padding,
+            self.max_tokens_per_expert,
+        );
 
         // Find individual shuffled indices on the local rank.
         let mut source_dispatch_offset = vec![0; num_recv_tokens];
@@ -816,4 +829,21 @@ fn extract_addrs(
     dst_mr: &MemoryRegionDescriptor,
 ) -> fabric_lib::api::SmallVec<DomainAddress> {
     dst_mr.addr_rkey_list.iter().map(|(addr, _)| addr.clone()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_padded_offsets;
+
+    #[test]
+    fn compact_offsets_respect_expert_padding() {
+        assert_eq!(compute_padded_offsets(&[3, 0, 5], 4, 0), vec![0, 4, 4]);
+        assert_eq!(compute_padded_offsets(&[1, 4, 5], 4, 0), vec![0, 4, 8]);
+    }
+
+    #[test]
+    fn batched_offsets_use_fixed_expert_stride() {
+        assert_eq!(compute_padded_offsets(&[3, 0, 5], 4, 8), vec![0, 8, 16]);
+        assert_eq!(compute_padded_offsets(&[1, 4, 5], 1, 128), vec![0, 128, 256]);
+    }
 }

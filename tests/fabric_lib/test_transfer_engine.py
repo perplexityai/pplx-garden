@@ -1,13 +1,17 @@
-# ruff: noqa: T201
+# ruff: noqa: E402, T201
 
 import dataclasses
 import pickle
 import queue
 import signal
 import threading
-from typing import Any, assert_never
+from typing import Any
 
 import pytest
+from typing_extensions import assert_never
+
+pytest.importorskip("pplx_garden._rust", reason="pplx_garden native extension is not built")
+
 import torch
 import torch.multiprocessing as mp
 import triton  # type: ignore

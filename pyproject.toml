@@ -10,7 +10,13 @@ authors = [
     { name = "Nandor Licker", email = "nandor@perplexity.ai" },
 ]
 dynamic = ["version"]
-dependencies = ["numpy"]
+dependencies = ["numpy", "typing_extensions"]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+    "torch",
+]
 
 [tool.setuptools]
 package-dir = {"" = "python"}
@@ -84,8 +90,11 @@ markers = [
     "ci_2gpu: marks to run on p5-2gpu runner (To run on p5-1gpu runner, use -m 'not (ci_2gpu or ci_4gpu)')",
     "ci_4gpu: marks to run on p5-4gpu runner (To run on p5-1gpu runner, use -m 'not (ci_2gpu or ci_4gpu)')",
     "cpu_only: marks tests which do not use a GPU",
+    "cuda: marks tests which require CUDA",
+    "distributed: marks tests which require multiple ranks or processes",
     "fabric: marks tests which require libfabric",
     "kernel: marks kernel tests (deselect with -m 'not kernel')",
+    "perf: marks performance and regression benchmarks",
 ]
 
 [tool.coverage.run]

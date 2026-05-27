@@ -1,8 +1,12 @@
+# ruff: noqa: E402
+
 from dataclasses import dataclass
 from typing import Optional
 
 import pytest
 import torch
+
+pytest.importorskip("pplx_garden._rust", reason="pplx_garden native extension is not built")
 
 from pplx_garden.distributed import ParallelGroup, ParallelLaunch
 from pplx_garden.kernels.p2p_all_to_all import P2PAllToAll
@@ -10,7 +14,15 @@ from pplx_garden.utils import logging_utils
 from pplx_garden.utils.math import round_up
 from pplx_garden.utils.torch import has_tp
 from tests.fabric import get_nets_per_gpu
-from tests.markers import gpu_only, mark_ci_2gpu, mark_ci_4gpu, mark_fabric, mark_kernel
+from tests.markers import (
+    gpu_only,
+    mark_ci_2gpu,
+    mark_ci_4gpu,
+    mark_cuda,
+    mark_distributed,
+    mark_fabric,
+    mark_kernel,
+)
 from tests.p2p_all_to_all.data import RankTestData
 
 logger = logging_utils.get_logger(__name__)
@@ -39,6 +51,7 @@ class _Config:
     scale_dtype: Optional[torch.dtype]
     expert_padding: int
     nvlink_group: Optional[int]
+    max_tokens_per_expert: Optional[int] = None
 
 
 def _act(x: torch.Tensor, x_scale: Optional[torch.Tensor]) -> torch.Tensor:
@@ -128,6 +141,7 @@ def _test_p2p_all_to_all_worker(
         dp_group=tp_group,
         node_group=node_group,
         global_group=global_group,
+        max_tokens_per_expert=config.max_tokens_per_expert,
     )
 
     try:
@@ -146,11 +160,15 @@ def _test_p2p_all_to_all_worker(
             dtype=torch.int32,
             device=device,
         )
-        out_expert_x = torch.empty(
-            (max_recv_tokens, hidden_dim),
-            dtype=in_dtype,
-            device=device,
-        )
+        if config.max_tokens_per_expert is None:
+            out_expert_x_shape = (max_recv_tokens, hidden_dim)
+        else:
+            out_expert_x_shape = (
+                num_local_experts,
+                config.max_tokens_per_expert,
+                hidden_dim,
+            )
+        out_expert_x = torch.empty(out_expert_x_shape, dtype=in_dtype, device=device)
         out_tokens = torch.empty(
             (max_num_tokens, hidden_dim),
             dtype=out_dtype,
@@ -160,10 +178,16 @@ def _test_p2p_all_to_all_worker(
         if hidden_dim_scale is not None or scale_dtype is not None:
             assert scale_dtype is not None
             assert hidden_dim_scale is not None
+            if config.max_tokens_per_expert is None:
+                out_expert_x_scale_shape = (max_recv_tokens, hidden_dim_scale)
+            else:
+                out_expert_x_scale_shape = (
+                    num_local_experts,
+                    config.max_tokens_per_expert,
+                    hidden_dim_scale,
+                )
             out_expert_x_scale = torch.empty(
-                (max_recv_tokens, hidden_dim_scale),
-                dtype=scale_dtype,
-                device=device,
+                out_expert_x_scale_shape, dtype=scale_dtype, device=device
             )
         else:
             out_expert_x_scale = None
@@ -179,7 +203,21 @@ def _test_p2p_all_to_all_worker(
             weights=local_rank.weights,
             bound_m=None,
         )
-        expert_y = _act(out_expert_x, out_expert_x_scale).to(out_dtype)
+        if out_expert_x.ndim == 3:
+            flat_out_expert_x = out_expert_x.reshape(-1, hidden_dim)
+            flat_out_expert_x_scale = (
+                None
+                if out_expert_x_scale is None
+                else out_expert_x_scale.reshape(-1, hidden_dim_scale)
+            )
+            expert_y = _act(flat_out_expert_x, flat_out_expert_x_scale).to(out_dtype)
+            expert_y = expert_y.reshape(
+                num_local_experts,
+                config.max_tokens_per_expert,
+                hidden_dim,
+            )
+        else:
+            expert_y = _act(out_expert_x, out_expert_x_scale).to(out_dtype)
         all_to_all.combine(
             out_tokens=out_tokens,
             indices=local_rank.indices,
@@ -199,11 +237,15 @@ def _test_p2p_all_to_all_worker(
 
         tokens_on_rank = set()
         index = 0
-        for n in expected_local_tokens.tolist():
-            for token in out_expert_x[index : index + n]:
+        for expert, n in enumerate(expected_local_tokens.tolist()):
+            if out_expert_x.ndim == 3:
+                expert_tokens = out_expert_x[expert, :n]
+            else:
+                expert_tokens = out_expert_x[index : index + n]
+            for token in expert_tokens:
                 tokens_on_rank.add(hash_token(token))
-
-            index = round_up(index + n, config.expert_padding)
+            if out_expert_x.ndim == 2:
+                index = round_up(index + n, config.expert_padding)
     except Exception:
         logger.exception("All-to-all failed")
         raise
@@ -236,6 +278,8 @@ def _test_p2p_all_to_all_worker(
 
 @mark_fabric
 @mark_kernel
+@mark_cuda
+@mark_distributed
 @gpu_only
 @pytest.mark.parametrize(
     "config",
@@ -262,6 +306,30 @@ def _test_p2p_all_to_all_worker(
                 pytest.mark.skipif(not has_tp(2), reason="Requires 2 devices"),
             ],
             id="TP2-NIC1-FP32",
+        ),
+        pytest.param(
+            _Config(
+                world_size=2,
+                dp_size=1,
+                nets_per_gpu=1,
+                max_num_tokens=128,
+                num_experts=16,
+                hidden_dim=128,
+                hidden_dim_scale=None,
+                num_experts_per_token=2,
+                max_private_tokens=None,
+                in_dtype=torch.float32,
+                out_dtype=torch.float32,
+                scale_dtype=None,
+                expert_padding=1,
+                nvlink_group=None,
+                max_tokens_per_expert=256,
+            ),
+            marks=[
+                mark_ci_2gpu,
+                pytest.mark.skipif(not has_tp(2), reason="Requires 2 devices"),
+            ],
+            id="TP2-NIC1-FP32-BATCHED",
         ),
         pytest.param(
             _Config(

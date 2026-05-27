@@ -1,8 +1,9 @@
 import pickle
 from dataclasses import dataclass
-from typing import Optional, override
+from typing import Optional
 
 import torch
+from typing_extensions import override
 
 from pplx_garden.distributed import ParallelGroup
 from pplx_garden.fabric_lib import (

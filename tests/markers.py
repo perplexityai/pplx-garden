@@ -6,8 +6,11 @@ from pplx_garden.utils.torch import has_cuda, has_tp
 mark_ci_2gpu = pytest.mark.ci_2gpu
 mark_ci_4gpu = pytest.mark.ci_4gpu
 
+mark_cuda = pytest.mark.cuda
+mark_distributed = pytest.mark.distributed
 mark_fabric = pytest.mark.fabric
 mark_kernel = pytest.mark.kernel
+mark_perf = pytest.mark.perf
 
 
 def mark_tp(n: int) -> pytest.MarkDecorator:

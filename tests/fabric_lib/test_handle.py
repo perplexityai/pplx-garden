@@ -1,8 +1,11 @@
-# ruff: noqa: T201
+# ruff: noqa: E402, T201
 
 import pickle
 
+import pytest
 import torch
+
+pytest.importorskip("pplx_garden._rust", reason="pplx_garden native extension is not built")
 
 from pplx_garden.fabric_lib import TransferEngine
 from tests.markers import gpu_only, mark_fabric
