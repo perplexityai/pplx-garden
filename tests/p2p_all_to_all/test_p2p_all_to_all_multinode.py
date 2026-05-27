@@ -134,13 +134,6 @@ def _init_method(port_offset: int) -> str:
                 nvlink_group=4,
             ),
             3,
-            marks=pytest.mark.xfail(
-                strict=False,
-                reason=(
-                    "P2PAllToAll combine output is still incorrect for "
-                    "multinode TP groups > 1"
-                ),
-            ),
             id="EP8-TP4-BF16",
         ),
     ],
