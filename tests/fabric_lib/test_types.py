@@ -1,9 +1,5 @@
 # ruff: noqa: E402
 
-import pytest
-
-pytest.importorskip("pplx_garden._rust", reason="pplx_garden native extension is not built")
-
 from pplx_garden.fabric_lib import DomainAddress
 
 

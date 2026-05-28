@@ -6,8 +6,6 @@ from typing import Optional
 import pytest
 import torch
 
-pytest.importorskip("pplx_garden._rust", reason="pplx_garden native extension is not built")
-
 from pplx_garden.distributed import ParallelGroup, ParallelLaunch
 from pplx_garden.kernels.p2p_all_to_all import P2PAllToAll
 from pplx_garden.utils import logging_utils

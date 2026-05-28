@@ -6,8 +6,6 @@ from urllib.parse import urlparse
 import pytest
 import torch
 
-pytest.importorskip("pplx_garden._rust", reason="pplx_garden native extension is not built")
-
 from pplx_garden.distributed import ParallelLaunch
 from tests.markers import (
     gpu_only,
