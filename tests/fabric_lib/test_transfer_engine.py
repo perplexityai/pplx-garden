@@ -851,6 +851,10 @@ def _test_imm_count_client(
 @mark_fabric
 @gpu_only
 @mark_ci_4gpu
+@pytest.mark.skipif(
+    os.environ.get("FI_PROVIDER") == "cxi",
+    reason="CXI runtime does not support aggregate immediate-count callbacks",
+)
 def test_imm_count(nets_per_gpu: int) -> None:
     ctx = mp.get_context("spawn")
 
