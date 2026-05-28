@@ -152,16 +152,6 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
             }
         }
 
-        // Bookkeeping.
-        self.write_ops.insert(
-            transfer_id,
-            WriteOpContext {
-                num_used_domains: dst_mrs.len(),
-                cnt_domain_completion: 0,
-                tx_counter,
-            },
-        );
-
         // Determine the number of imms to send via each domain.
         let num_domains = self.domains.len();
         let (first_domain, imm_per_domain) = match domain {
@@ -185,6 +175,16 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
                 (domain_idx as usize, dst_mrs.len())
             }
         };
+
+        // Bookkeeping.
+        self.write_ops.insert(
+            transfer_id,
+            WriteOpContext {
+                num_used_domains: dst_mrs.chunks(imm_per_domain).len(),
+                cnt_domain_completion: 0,
+                tx_counter,
+            },
+        );
 
         // Chunk by domain and submit the writes.
         for (i, dst_mrs) in dst_mrs.chunks(imm_per_domain).enumerate() {

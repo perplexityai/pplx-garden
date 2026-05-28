@@ -81,7 +81,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
         if constexpr (NODE_SIZE > 1) {
             auto local_rank = rank % NODE_SIZE;
             if (lane_id < NODE_SIZE) {
-                auto *flag = &sync_ptrs[lane_id][local_rank];
+                auto *flag = &sync_ptrs[local_rank][lane_id];
                 while (ld_volatile_u32(flag) != counter);
             }
         }

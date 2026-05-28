@@ -267,24 +267,13 @@ def correctness_check(r: AllToAllResource) -> None:
 
 
 def benchmark(
-    r: AllToAllResource, num_warmup: int, num_repeats: int, output: Path
+    r: AllToAllResource, num_warmup: int, num_repeats: int, output: Path, verbose: bool = False
 ) -> None:
+    logger.info("Starting benchmark setup")
     local_rank = r.create_rank_data(r.dp_rank)
     rng = make_rng(r.device, r.dp_rank)
-    out_dummy = torch.empty((1,), dtype=torch.float32, device=r.device)
-    gemm = torch.empty(
-        (2048, 2048) if r.cfg.max_num_tokens <= 128 else (8192, 8192),
-        dtype=torch.float32,
-        device=r.device,
-    )
 
-    def wait() -> None:
-        # Wait to simulate the delay of other layers.
-        torch.distributed.all_reduce(out_dummy)
-        _ = gemm @ gemm
-        torch.distributed.all_reduce(out_dummy)
-
-    def dispatch(do_send: bool, do_recv: bool) -> None:
+    def dispatch() -> None:
         r.all_to_all.dispatch(
             out_expert_num_tokens=r.expert_num_tokens,
             out_expert_x=r.out_expert_x,
@@ -294,92 +283,44 @@ def benchmark(
             indices=local_rank.indices,
             weights=local_rank.weights,
             bound_m=local_rank.bound_m,
-            do_send=do_send,
-            do_recv=do_recv,
+            do_send=True,
+            do_recv=True,
         )
 
-    def combine(do_send: bool, do_recv: bool) -> None:
+    def combine() -> None:
         r.all_to_all.combine(
             out_tokens=r.out_tokens,
             indices=local_rank.indices,
             weights=local_rank.weights,
             expert_y=r.expert_y,
             bound_m=local_rank.bound_m,
-            do_send=do_send,
-            do_recv=do_recv,
+            do_send=True,
+            do_recv=True,
         )
 
-    # Create and initialize events for timing.
-    events = []
+    # Combined Benchmark Events
+    dispatch_events = []
+    combine_events = []
     for _ in range(num_warmup + num_repeats):
-        dispatch_start = torch.cuda.Event(enable_timing=True)
-        dispatch_end = torch.cuda.Event(enable_timing=True)
-        combine_start = torch.cuda.Event(enable_timing=True)
-        combine_end = torch.cuda.Event(enable_timing=True)
-        dispatch_send_start = torch.cuda.Event(enable_timing=True)
-        dispatch_send_end = torch.cuda.Event(enable_timing=True)
-        dispatch_recv_start = torch.cuda.Event(enable_timing=True)
-        dispatch_recv_end = torch.cuda.Event(enable_timing=True)
-        combine_send_start = torch.cuda.Event(enable_timing=True)
-        combine_send_end = torch.cuda.Event(enable_timing=True)
-        combine_recv_start = torch.cuda.Event(enable_timing=True)
-        combine_recv_end = torch.cuda.Event(enable_timing=True)
-        dispatch_start.record()
-        dispatch_end.record()
-        combine_start.record()
-        combine_end.record()
-        dispatch_send_start.record()
-        dispatch_send_end.record()
-        dispatch_recv_start.record()
-        dispatch_recv_end.record()
-        combine_send_start.record()
-        combine_send_end.record()
-        combine_recv_start.record()
-        combine_recv_end.record()
-        events.append(
-            (
-                dispatch_start,
-                dispatch_end,
-                combine_start,
-                combine_end,
-                dispatch_send_start,
-                dispatch_send_end,
-                dispatch_recv_start,
-                dispatch_recv_end,
-                combine_send_start,
-                combine_send_end,
-                combine_recv_start,
-                combine_recv_end,
-            )
-        )
+        d_start = torch.cuda.Event(enable_timing=True)
+        d_end = torch.cuda.Event(enable_timing=True)
+        dispatch_events.append((d_start, d_end))
 
-    # Benchmark loop
+        c_start = torch.cuda.Event(enable_timing=True)
+        c_end = torch.cuda.Event(enable_timing=True)
+        combine_events.append((c_start, c_end))
+
+    logger.info("[Rank %d] Starting lockstep warmup (%d iterations)", r.global_group.rank, num_warmup)
     last_report_time = time.time()
     for i in range(num_warmup + num_repeats):
-        if i + 1 == num_warmup:
-            # Start profiling one iteration before the bench starts.
+        if i == num_warmup:
+            if r.global_group.rank == 0:
+                logger.info("Completed warmup. Starting benchmark (%d iterations)", num_repeats)
             torch.cuda.profiler.start()
-        now = time.time()
-        if now - last_report_time > 1 or i + 1 == num_warmup + num_repeats:
-            logger.info("Iteration %i/%i", i + 1, num_warmup + num_repeats)
-            last_report_time = now
-
-        (
-            dispatch_start,
-            dispatch_end,
-            combine_start,
-            combine_end,
-            dispatch_send_start,
-            dispatch_send_end,
-            dispatch_recv_start,
-            dispatch_recv_end,
-            combine_send_start,
-            combine_send_end,
-            combine_recv_start,
-            combine_recv_end,
-        ) = events[i]
 
         # Update indices
+        if verbose:
+            logger.info("[Rank %d] Iteration %d - Generating indices...", r.global_group.rank, i + 1)
         local_rank.indices = rand_topk_idx(
             r.cfg.max_num_tokens,
             r.cfg.num_experts,
@@ -388,127 +329,81 @@ def benchmark(
             r.device,
         )
 
-        # Send-Recv back to back
-        with profile_range("back-to-back"):
-            wait()
+        # Time Dispatch
+        if verbose:
+            logger.info("[Rank %d] Iteration %d - Starting dispatch...", r.global_group.rank, i + 1)
+        d_start, d_end = dispatch_events[i]
+        d_start.record()
+        dispatch()
+        d_end.record()
+        if verbose:
+            logger.info("[Rank %d] Iteration %d - Dispatch completed", r.global_group.rank, i + 1)
 
-            dispatch_start.record()
-            dispatch(do_send=True, do_recv=True)
-            dispatch_end.record()
+        # Time Combine
+        if verbose:
+            logger.info("[Rank %d] Iteration %d - Starting combine...", r.global_group.rank, i + 1)
+        c_start, c_end = combine_events[i]
+        c_start.record()
+        combine()
+        c_end.record()
+        if verbose:
+            logger.info("[Rank %d] Iteration %d - Combine completed", r.global_group.rank, i + 1)
 
-            wait()
+        if verbose:
+            logger.info("[Rank %d] Iteration %d - Synchronizing CUDA...", r.global_group.rank, i + 1)
+            torch.cuda.synchronize()
+            logger.info("[Rank %d] Iteration %d - Synchronized successfully", r.global_group.rank, i + 1)
+            logger.info("[Rank %d] Iteration %d - Entering global process group barrier...", r.global_group.rank, i + 1)
+            r.global_group.barrier()
+            logger.info("[Rank %d] Iteration %d - Passed global barrier", r.global_group.rank, i + 1)
+            if (i + 1) % 10 == 0 or i < 5:
+                logger.info("[Rank %d] Iteration %d/%d completed", r.global_group.rank, i + 1, num_warmup + num_repeats)
 
-            combine_start.record()
-            combine(do_send=True, do_recv=True)
-            combine_end.record()
-
-        # Insert long kernel in between send and recv
-        with profile_range("overlap"):
-            wait()
-
-            dispatch_send_start.record()
-            dispatch(do_send=True, do_recv=False)
-            dispatch_send_end.record()
-
-            wait()  # Fake overlap work
-
-            dispatch_recv_start.record()
-            dispatch(do_send=False, do_recv=True)
-            dispatch_recv_end.record()
-
-            wait()
-
-            combine_send_start.record()
-            combine(do_send=True, do_recv=False)
-            combine_send_end.record()
-
-            wait()  # Fake overlap work
-
-            combine_recv_start.record()
-            combine(do_send=False, do_recv=True)
-            combine_recv_end.record()
+        if (i + 1) % 100 == 0 or i + 1 == num_warmup + num_repeats:
+            now = time.time()
+            if now - last_report_time > 1 or i + 1 == num_warmup + num_repeats:
+                if r.global_group.rank == 0:
+                    logger.info("Iteration %i/%i", i + 1, num_warmup + num_repeats)
+                last_report_time = now
 
     torch.cuda.synchronize()
     torch.cuda.profiler.stop()
+    logger.info("[Rank %d] Completed benchmark iterations", r.global_group.rank)
 
     dispatch_times: list[float] = []
-    dispatch_send_times: list[float] = []
-    dispatch_recv_times: list[float] = []
+    for start, end in dispatch_events[num_warmup:]:
+        dispatch_times.append(start.elapsed_time(end) * 1000)
+
     combine_times: list[float] = []
-    combine_send_times: list[float] = []
-    combine_recv_times: list[float] = []
-    for (
-        dispatch_st,
-        dispatch_en,
-        combine_st,
-        combine_en,
-        dispatch_send_st,
-        dispatch_send_en,
-        dispatch_recv_st,
-        dispatch_recv_en,
-        combine_send_st,
-        combine_send_en,
-        combine_recv_st,
-        combine_recv_en,
-    ) in events[num_warmup:]:
-        dispatch_times.append(dispatch_st.elapsed_time(dispatch_en) * 1000)
-        combine_times.append(combine_st.elapsed_time(combine_en) * 1000)
-        dispatch_send_times.append(
-            dispatch_send_st.elapsed_time(dispatch_send_en) * 1000
-        )
-        dispatch_recv_times.append(
-            dispatch_recv_st.elapsed_time(dispatch_recv_en) * 1000
-        )
-        combine_send_times.append(combine_send_st.elapsed_time(combine_send_en) * 1000)
-        combine_recv_times.append(combine_recv_st.elapsed_time(combine_recv_en) * 1000)
+    for start, end in combine_events[num_warmup:]:
+        combine_times.append(start.elapsed_time(end) * 1000)
 
     # All-gather results from all ranks
     dispatch_times = sum(r.global_group.all_gather_object(dispatch_times), [])
     combine_times = sum(r.global_group.all_gather_object(combine_times), [])
-    dispatch_send_times = sum(r.global_group.all_gather_object(dispatch_send_times), [])
-    dispatch_recv_times = sum(r.global_group.all_gather_object(dispatch_recv_times), [])
-    combine_send_times = sum(r.global_group.all_gather_object(combine_send_times), [])
-    combine_recv_times = sum(r.global_group.all_gather_object(combine_recv_times), [])
 
-    # Report the results.
+    # Report the results
     if r.global_group.rank == 0:
         stat_dispatch = Statistics.create(dispatch_times)
-        stat_dispatch_send = Statistics.create(dispatch_send_times)
-        stat_dispatch_recv = Statistics.create(dispatch_recv_times)
         stat_combine = Statistics.create(combine_times)
-        stat_combine_send = Statistics.create(combine_send_times)
-        stat_combine_recv = Statistics.create(combine_recv_times)
 
         dispatch_bandwidth = r.cfg.dispatch_bytes / stat_dispatch.p50 * 1e-3
         combine_bandwidth = r.cfg.combine_bytes / stat_combine.p50 * 1e-3
 
         logger.info(
-            "Dispatch both time: %s, %.1f GB/s",
+            "Dispatch time: %s, %.1f GB/s",
             stat_dispatch,
             dispatch_bandwidth,
         )
-        logger.info("Dispatch send time: %s", stat_dispatch_send)
-        logger.info("Dispatch recv time: %s", stat_dispatch_recv)
-
         logger.info(
-            "Combine both time: %s, %.1f GB/s",
+            "Combine time: %s, %.1f GB/s",
             stat_combine,
             combine_bandwidth,
         )
-        logger.info("Combine send time: %s", stat_combine_send)
-        logger.info("Combine recv time: %s", stat_combine_recv)
 
         data = {
-            "dispatch": {
-                "both": asdict(stat_dispatch),
-                "send": asdict(stat_dispatch_send),
-                "recv": asdict(stat_dispatch_recv),
-            },
-            "combine": {
-                "both": asdict(stat_combine),
-                "send": asdict(stat_combine_send),
-                "recv": asdict(stat_combine_recv),
-            },
+            "dispatch": asdict(stat_dispatch),
+            "combine": asdict(stat_combine),
         }
 
         with output.open("w") as f:
@@ -524,14 +419,18 @@ def _worker(
     num_repeats: int,
     output: Path,
     check: bool,
+    verbose: bool = False,
 ) -> None:
     """Benchmark worker process."""
 
     assert dp_group is not None
     assert global_group is not None
 
-    if global_group.rank == 0:
-        logging_utils.setup(level="INFO")
+    logging_utils.setup(level="INFO")
+
+    import os
+    env_verbose = "PPLX_GARDEN_DEBUG" in os.environ or "PPLX_DEBUG" in os.environ
+    verbose = verbose or env_verbose
 
     r = AllToAllResource(device, dp_group, global_group, config)
 
@@ -557,7 +456,7 @@ def _worker(
             logger.info("Skipping correctness check")
 
         # Benchmark.
-        benchmark(r, num_warmup, num_repeats, output)
+        benchmark(r, num_warmup, num_repeats, output, verbose=verbose)
     finally:
         global_group.barrier()
         r.all_to_all.destroy()
@@ -592,6 +491,9 @@ def main() -> None:
     parser.add_argument(
         "--check", type=bool, default=True, action=argparse.BooleanOptionalAction
     )
+    parser.add_argument(
+        "--verbose", action="store_true", help="Enable verbose logging and syncs"
+    )
     args = parser.parse_args()
 
     config = AllToAllConfig(
@@ -620,8 +522,10 @@ def main() -> None:
         args.num_repeats,
         args.output,
         args.check,
+        args.verbose,
     )
 
 
 if __name__ == "__main__":
+    logger.info("Launching benchmark script")
     main()

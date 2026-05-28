@@ -402,7 +402,7 @@ impl WorkerState {
         let num_dispatch_tx = 1
             + if num_private_ranges == 0 { 0 } else { 1 }
             + if route.dispatch_ranges.is_empty() { 0 } else { 1 };
-        let num_combine_tx = 1 + if self.world_size > self.node_size { 1 } else { 0 };
+        let num_combine_tx = if route.combine_ranges.is_empty() { 0 } else { 1 };
         let num_remote_nodes = self.world_size / self.node_size - 1;
         let groups_per_node = self.node_size / self.dp_size;
         let num_combine_imm = (num_remote_nodes * groups_per_node) as u32 * num_shards;
@@ -833,8 +833,9 @@ impl WorkerState {
         }
 
         // Wait for the sends to complete.
-        let old = self.tx_counter.fetch_sub(num_tx as i64, Ordering::Relaxed);
-        if old < num_tx as i64 {
+        let num_tx_total = num_tx as i64 + 1;
+        let old = self.tx_counter.fetch_sub(num_tx_total, Ordering::Relaxed);
+        if old < num_tx_total {
             while self.tx_counter.load(Ordering::Relaxed) < 0 {
                 if !self.is_running() {
                     range_end!(barrier);

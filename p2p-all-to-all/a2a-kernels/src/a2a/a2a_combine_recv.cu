@@ -160,7 +160,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
             auto local_rank = rank % NODE_SIZE;
             unsigned peer = lane_id;
             if (peer < NODE_SIZE) {
-                st_volatile_u32(&sync_ptrs[local_rank][peer], counter + 1);
+                st_volatile_u32(&sync_ptrs[peer][local_rank], counter + 1);
             }
         }
     }
