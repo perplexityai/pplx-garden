@@ -2,7 +2,7 @@ use std::{
     ffi::c_void,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -110,6 +110,14 @@ pub(crate) struct WorkerState {
     route_write_op: TransferRequest,
     dispatch_barrier_write_op: TransferRequest,
     combine_barrier_write_op: TransferRequest,
+    pub(crate) accumulated_local_dispatch_bytes: AtomicU64,
+    pub(crate) accumulated_nvlink_dispatch_bytes: AtomicU64,
+    pub(crate) accumulated_network_dispatch_bytes: AtomicU64,
+    pub(crate) accumulated_local_combine_bytes: AtomicU64,
+    pub(crate) accumulated_nvlink_combine_bytes: AtomicU64,
+    pub(crate) accumulated_network_combine_bytes: AtomicU64,
+    pub(crate) peer_dispatch_bytes: Vec<AtomicU64>,
+    pub(crate) peer_combine_bytes: Vec<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -310,6 +318,14 @@ impl WorkerState {
             route_write_op,
             dispatch_barrier_write_op,
             combine_barrier_write_op,
+            accumulated_local_dispatch_bytes: AtomicU64::new(0),
+            accumulated_nvlink_dispatch_bytes: AtomicU64::new(0),
+            accumulated_network_dispatch_bytes: AtomicU64::new(0),
+            accumulated_local_combine_bytes: AtomicU64::new(0),
+            accumulated_nvlink_combine_bytes: AtomicU64::new(0),
+            accumulated_network_combine_bytes: AtomicU64::new(0),
+            peer_dispatch_bytes: (0..world_size).map(|_| AtomicU64::new(0)).collect(),
+            peer_combine_bytes: (0..world_size).map(|_| AtomicU64::new(0)).collect(),
         })
     }
 
@@ -798,6 +814,38 @@ impl WorkerState {
                     dst_offset,
                     dst_mr,
                 });
+            }
+        }
+
+        // Telemetry counters.
+        for peer_rank in 0..self.world_size {
+            let dispatch_tokens = tokens_to_rank[peer_rank] as u64;
+            let dispatch_bytes = dispatch_tokens * self.get_dispatch_token_dim() as u64;
+            if dispatch_bytes > 0 {
+                self.peer_dispatch_bytes[peer_rank].fetch_add(dispatch_bytes, Ordering::Relaxed);
+                if peer_rank == self.rank {
+                    self.accumulated_local_dispatch_bytes.fetch_add(dispatch_bytes, Ordering::Relaxed);
+                } else if peer_rank / self.node_size == rank_node {
+                    self.accumulated_nvlink_dispatch_bytes.fetch_add(dispatch_bytes, Ordering::Relaxed);
+                } else {
+                    self.accumulated_network_dispatch_bytes.fetch_add(dispatch_bytes, Ordering::Relaxed);
+                }
+            }
+        }
+
+        for peer_group in 0..num_dp_groups {
+            let peer_rank = peer_group * self.dp_size + self.dp_rank;
+            let combine_tokens = tokens_from_group[peer_group] as u64;
+            let combine_bytes = combine_tokens * self.get_combine_token_dim() as u64;
+            if combine_bytes > 0 {
+                self.peer_combine_bytes[peer_rank].fetch_add(combine_bytes, Ordering::Relaxed);
+                if peer_rank == self.rank {
+                    self.accumulated_local_combine_bytes.fetch_add(combine_bytes, Ordering::Relaxed);
+                } else if peer_rank / self.node_size == rank_node {
+                    self.accumulated_nvlink_combine_bytes.fetch_add(combine_bytes, Ordering::Relaxed);
+                } else {
+                    self.accumulated_network_combine_bytes.fetch_add(combine_bytes, Ordering::Relaxed);
+                }
             }
         }
 

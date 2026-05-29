@@ -1,6 +1,6 @@
 import pickle
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 from typing_extensions import override
@@ -715,6 +715,11 @@ class P2PAllToAll(AllToAllKernel):
             accumulate=accumulate,
             send_done_event=send_done_event,
         )
+
+    def get_perf_stats(self) -> dict[str, Any]:
+        if self._all_to_all is not None:
+            return self._all_to_all.get_perf_stats()
+        return {}
 
     @override
     def destroy(self) -> None:

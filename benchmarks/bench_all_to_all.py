@@ -378,9 +378,13 @@ def benchmark(
     for start, end in combine_events[num_warmup:]:
         combine_times.append(start.elapsed_time(end) * 1000)
 
+    # Retrieve performance stats from the library
+    perf_stats = r.all_to_all.get_perf_stats()
+
     # All-gather results from all ranks
     dispatch_times = sum(r.global_group.all_gather_object(dispatch_times), [])
     combine_times = sum(r.global_group.all_gather_object(combine_times), [])
+    all_perf_stats = r.global_group.all_gather_object(perf_stats)
 
     # Report the results
     if r.global_group.rank == 0:
@@ -390,24 +394,144 @@ def benchmark(
         dispatch_bandwidth = r.cfg.dispatch_bytes / stat_dispatch.p50 * 1e-3
         combine_bandwidth = r.cfg.combine_bytes / stat_combine.p50 * 1e-3
 
-        logger.info(
-            "Dispatch time: %s, %.1f GB/s",
-            stat_dispatch,
-            dispatch_bandwidth,
-        )
-        logger.info(
-            "Combine time: %s, %.1f GB/s",
-            stat_combine,
-            combine_bandwidth,
-        )
+        # Aggregate link metrics (sum across all ranks, then compute per-rank averages)
+        num_total_iters = num_warmup + num_repeats
+        total_local_disp = sum(s.get('local_dispatch_bytes', 0) for s in all_perf_stats)
+        total_nvlink_disp = sum(s.get('nvlink_dispatch_bytes', 0) for s in all_perf_stats)
+        total_network_disp = sum(s.get('network_dispatch_bytes', 0) for s in all_perf_stats)
+
+        total_local_comb = sum(s.get('local_combine_bytes', 0) for s in all_perf_stats)
+        total_nvlink_comb = sum(s.get('nvlink_combine_bytes', 0) for s in all_perf_stats)
+        total_network_comb = sum(s.get('network_combine_bytes', 0) for s in all_perf_stats)
+
+        # Average per rank per iteration
+        num_ranks = len(all_perf_stats)
+        avg_local_disp_bytes = total_local_disp / num_ranks / num_total_iters
+        avg_nvlink_disp_bytes = total_nvlink_disp / num_ranks / num_total_iters
+        avg_network_disp_bytes = total_network_disp / num_ranks / num_total_iters
+
+        avg_local_comb_bytes = total_local_comb / num_ranks / num_total_iters
+        avg_nvlink_comb_bytes = total_nvlink_comb / num_ranks / num_total_iters
+        avg_network_comb_bytes = total_network_comb / num_ranks / num_total_iters
+
+        # Compute per-link bandwidths using p50 elapsed time
+        nvlink_disp_bandwidth = avg_nvlink_disp_bytes / stat_dispatch.p50 * 1e-3
+        network_disp_bandwidth = avg_network_disp_bytes / stat_dispatch.p50 * 1e-3
+
+        nvlink_comb_bandwidth = avg_nvlink_comb_bytes / stat_combine.p50 * 1e-3
+        network_comb_bandwidth = avg_network_comb_bytes / stat_combine.p50 * 1e-3
+
+        logger.info("============================================================")
+        logger.info("P2P All-to-All Link Performance Report")
+        logger.info("============================================================")
+        logger.info("Dispatch time: %s, %.1f GB/s", stat_dispatch, dispatch_bandwidth)
+        logger.info("  - Local Loopback:  %6.2f MB (%5.1f%%)", avg_local_disp_bytes / 1e6, avg_local_disp_bytes / r.cfg.dispatch_bytes * 100 if r.cfg.dispatch_bytes else 0)
+        logger.info("  - NVLink:          %6.2f MB (%5.1f%%) -> %6.1f GB/s", avg_nvlink_disp_bytes / 1e6, avg_nvlink_disp_bytes / r.cfg.dispatch_bytes * 100 if r.cfg.dispatch_bytes else 0, nvlink_disp_bandwidth)
+        logger.info("  - Network (RDMA):  %6.2f MB (%5.1f%%) -> %6.1f GB/s", avg_network_disp_bytes / 1e6, avg_network_disp_bytes / r.cfg.dispatch_bytes * 100 if r.cfg.dispatch_bytes else 0, network_disp_bandwidth)
+        logger.info("------------------------------------------------------------")
+        logger.info("Combine time: %s, %.1f GB/s", stat_combine, combine_bandwidth)
+        logger.info("  - Local Loopback:  %6.2f MB (%5.1f%%)", avg_local_comb_bytes / 1e6, avg_local_comb_bytes / r.cfg.combine_bytes * 100 if r.cfg.combine_bytes else 0)
+        logger.info("  - NVLink:          %6.2f MB (%5.1f%%) -> %6.1f GB/s", avg_nvlink_comb_bytes / 1e6, avg_nvlink_comb_bytes / r.cfg.combine_bytes * 100 if r.cfg.combine_bytes else 0, nvlink_comb_bandwidth)
+        logger.info("  - Network (RDMA):  %6.2f MB (%5.1f%%) -> %6.1f GB/s", avg_network_comb_bytes / 1e6, avg_network_comb_bytes / r.cfg.combine_bytes * 100 if r.cfg.combine_bytes else 0, network_comb_bandwidth)
+        logger.info("============================================================")
+
+        # Let's print the per-rank breakdown to show detailed routing patterns
+        logger.info("Per-Rank Link Data Volume Breakdown (Average per iteration):")
+        for r_id, s in enumerate(all_perf_stats):
+            disp_local = s.get('local_dispatch_bytes', 0) / num_total_iters
+            disp_nvl = s.get('nvlink_dispatch_bytes', 0) / num_total_iters
+            disp_net = s.get('network_dispatch_bytes', 0) / num_total_iters
+            disp_total = disp_local + disp_nvl + disp_net
+
+            comb_local = s.get('local_combine_bytes', 0) / num_total_iters
+            comb_nvl = s.get('nvlink_combine_bytes', 0) / num_total_iters
+            comb_net = s.get('network_combine_bytes', 0) / num_total_iters
+            comb_total = comb_local + comb_nvl + comb_net
+
+            logger.info(
+                "  Rank %d: Dispatch [Local: %5.1f%%, NVLink: %5.1f%%, Network: %5.1f%%] | Combine [Local: %5.1f%%, NVLink: %5.1f%%, Network: %5.1f%%]",
+                r_id,
+                disp_local / disp_total * 100 if disp_total else 0,
+                disp_nvl / disp_total * 100 if disp_total else 0,
+                disp_net / disp_total * 100 if disp_total else 0,
+                comb_local / comb_total * 100 if comb_total else 0,
+                comb_nvl / comb_total * 100 if comb_total else 0,
+                comb_net / comb_total * 100 if comb_total else 0,
+            )
+        logger.info("============================================================")
+
+        # Print the P2P traffic matrix (bytes sent per rank pair)
+        logger.info("Peer-to-Peer Dispatch Traffic Matrix (Average MB sent from Rank -> Rank per iteration):")
+        header_cols = [f"To R{i}" for i in range(num_ranks)]
+        logger.info("  From  | " + " | ".join(f"{col:>8}" for col in header_cols))
+        logger.info("  " + "-" * (8 + num_ranks * 11))
+        for r_id, s in enumerate(all_perf_stats):
+            peer_disp = s.get('peer_dispatch_bytes', [0] * num_ranks)
+            row_cols = []
+            for target_rank in range(num_ranks):
+                val = peer_disp[target_rank] if target_rank < len(peer_disp) else 0
+                val_mb = val / num_total_iters / 1e6
+                row_cols.append(f"{val_mb:8.2f}")
+            logger.info(f"  Rank {r_id:2d} | " + " | ".join(row_cols))
+        logger.info("------------------------------------------------------------")
+
+        logger.info("Peer-to-Peer Combine Traffic Matrix (Average MB gathered from Rank -> Rank per iteration):")
+        logger.info("  From  | " + " | ".join(f"{col:>8}" for col in header_cols))
+        logger.info("  " + "-" * (8 + num_ranks * 11))
+        for r_id, s in enumerate(all_perf_stats):
+            peer_comb = s.get('peer_combine_bytes', [0] * num_ranks)
+            row_cols = []
+            for target_rank in range(num_ranks):
+                val = peer_comb[target_rank] if target_rank < len(peer_comb) else 0
+                val_mb = val / num_total_iters / 1e6
+                row_cols.append(f"{val_mb:8.2f}")
+            logger.info(f"  Rank {r_id:2d} | " + " | ".join(row_cols))
+        logger.info("============================================================")
+
+        # Print the P2P bandwidth matrix (GB/s per rank pair)
+        logger.info("Peer-to-Peer Dispatch Bandwidth Matrix (GB/s per link, self=x):")
+        logger.info("  From  | " + " | ".join(f"{col:>8}" for col in header_cols))
+        logger.info("  " + "-" * (8 + num_ranks * 11))
+        for r_id, s in enumerate(all_perf_stats):
+            peer_disp = s.get('peer_dispatch_bytes', [0] * num_ranks)
+            row_cols = []
+            for target_rank in range(num_ranks):
+                if target_rank == r_id:
+                    row_cols.append(f"{'x':>8}")
+                else:
+                    val = peer_disp[target_rank] if target_rank < len(peer_disp) else 0
+                    val_avg_bytes = val / num_total_iters
+                    val_gb_s = val_avg_bytes / stat_dispatch.p50 * 1e-3
+                    row_cols.append(f"{val_gb_s:8.2f}")
+            logger.info(f"  Rank {r_id:2d} | " + " | ".join(row_cols))
+        logger.info("------------------------------------------------------------")
+
+        logger.info("Peer-to-Peer Combine Bandwidth Matrix (GB/s per link, self=x):")
+        logger.info("  From  | " + " | ".join(f"{col:>8}" for col in header_cols))
+        logger.info("  " + "-" * (8 + num_ranks * 11))
+        for r_id, s in enumerate(all_perf_stats):
+            peer_comb = s.get('peer_combine_bytes', [0] * num_ranks)
+            row_cols = []
+            for target_rank in range(num_ranks):
+                if target_rank == r_id:
+                    row_cols.append(f"{'x':>8}")
+                else:
+                    val = peer_comb[target_rank] if target_rank < len(peer_comb) else 0
+                    val_avg_bytes = val / num_total_iters
+                    val_gb_s = val_avg_bytes / stat_combine.p50 * 1e-3
+                    row_cols.append(f"{val_gb_s:8.2f}")
+            logger.info(f"  Rank {r_id:2d} | " + " | ".join(row_cols))
+        logger.info("============================================================")
 
         data = {
             "dispatch": asdict(stat_dispatch),
             "combine": asdict(stat_combine),
+            "perf_stats": all_perf_stats,
         }
 
-        with output.open("w") as f:
-            f.write(json.dumps(data))
+        if str(output) != "/dev/stdout":
+            with output.open("w") as f:
+                f.write(json.dumps(data, indent=2))
 
 
 def _worker(

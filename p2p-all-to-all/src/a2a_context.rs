@@ -1,4 +1,4 @@
-use std::{ffi::c_void, ptr::null_mut, sync::Arc, thread::JoinHandle};
+use std::{ffi::c_void, ptr::null_mut, sync::{Arc, atomic::Ordering}, thread::JoinHandle};
 
 use anyhow::{Result, anyhow};
 use cuda_lib::{
@@ -488,6 +488,30 @@ impl AllToAllContext {
 
         Ok(())
     }
+
+    pub fn get_perf_stats(&self) -> AllToAllPerfStats {
+        AllToAllPerfStats {
+            local_dispatch_bytes: self.worker.accumulated_local_dispatch_bytes.load(Ordering::Relaxed),
+            nvlink_dispatch_bytes: self.worker.accumulated_nvlink_dispatch_bytes.load(Ordering::Relaxed),
+            network_dispatch_bytes: self.worker.accumulated_network_dispatch_bytes.load(Ordering::Relaxed),
+            local_combine_bytes: self.worker.accumulated_local_combine_bytes.load(Ordering::Relaxed),
+            nvlink_combine_bytes: self.worker.accumulated_nvlink_combine_bytes.load(Ordering::Relaxed),
+            network_combine_bytes: self.worker.accumulated_network_combine_bytes.load(Ordering::Relaxed),
+            peer_dispatch_bytes: self.worker.peer_dispatch_bytes.iter().map(|v| v.load(Ordering::Relaxed)).collect(),
+            peer_combine_bytes: self.worker.peer_combine_bytes.iter().map(|v| v.load(Ordering::Relaxed)).collect(),
+        }
+    }
+}
+
+pub struct AllToAllPerfStats {
+    pub local_dispatch_bytes: u64,
+    pub nvlink_dispatch_bytes: u64,
+    pub network_dispatch_bytes: u64,
+    pub local_combine_bytes: u64,
+    pub nvlink_combine_bytes: u64,
+    pub network_combine_bytes: u64,
+    pub peer_dispatch_bytes: Vec<u64>,
+    pub peer_combine_bytes: Vec<u64>,
 }
 
 impl Drop for AllToAllContext {

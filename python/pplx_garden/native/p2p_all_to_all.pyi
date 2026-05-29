@@ -1,6 +1,8 @@
 # ruff: noqa: A002
 
 import torch
+from typing import Any
+
 
 from pplx_garden.fabric_lib import (
     DomainAddress,
@@ -97,3 +99,4 @@ class AllToAllContext:
         accumulate: bool,
         stream: int,
     ) -> None: ...
+    def get_perf_stats(self) -> dict[str, Any]: ...

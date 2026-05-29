@@ -5,8 +5,8 @@ use std::{
 
 use p2p_all_to_all::{AllToAllContext, AllToAllRankHandle};
 use pyo3::{
-    Bound, PyResult, exceptions::PyRuntimeError, pyclass, pymethods, types::PyModule,
-    types::PyModuleMethods,
+    Bound, PyResult, Python, exceptions::PyRuntimeError, pyclass, pymethods, types::PyModule,
+    types::PyModuleMethods, types::PyDict, types::PyDictMethods,
 };
 use torch_lib::ScalarType;
 
@@ -203,6 +203,20 @@ impl PyAllToAllContext {
                 stream,
             )
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    fn get_perf_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let stats = self.ctx.get_perf_stats();
+        let dict = PyDict::new(py);
+        dict.set_item("local_dispatch_bytes", stats.local_dispatch_bytes)?;
+        dict.set_item("nvlink_dispatch_bytes", stats.nvlink_dispatch_bytes)?;
+        dict.set_item("network_dispatch_bytes", stats.network_dispatch_bytes)?;
+        dict.set_item("local_combine_bytes", stats.local_combine_bytes)?;
+        dict.set_item("nvlink_combine_bytes", stats.nvlink_combine_bytes)?;
+        dict.set_item("network_combine_bytes", stats.network_combine_bytes)?;
+        dict.set_item("peer_dispatch_bytes", &stats.peer_dispatch_bytes)?;
+        dict.set_item("peer_combine_bytes", &stats.peer_combine_bytes)?;
+        Ok(dict)
     }
 }
 
