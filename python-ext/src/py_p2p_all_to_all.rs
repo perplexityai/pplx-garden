@@ -5,8 +5,8 @@ use std::{
 
 use p2p_all_to_all::{AllToAllContext, AllToAllRankHandle};
 use pyo3::{
-    Bound, PyResult, Python, exceptions::PyRuntimeError, pyclass, pymethods, types::PyModule,
-    types::PyModuleMethods, types::PyDict, types::PyDictMethods,
+    Bound, PyResult, Python, exceptions::PyRuntimeError, pyclass, pymethods,
+    types::PyDict, types::PyDictMethods, types::PyModule, types::PyModuleMethods,
 };
 use torch_lib::ScalarType;
 
@@ -59,6 +59,7 @@ impl PyAllToAllContext {
         )>,
         transfer_engine: &PyTransferEngine,
         worker_cpu: Option<u16>,
+        num_slots: usize,
     ) -> PyResult<Self> {
         let rank_handles = ranks
             .into_iter()
@@ -97,6 +98,7 @@ impl PyAllToAllContext {
             rank_handles,
             transfer_engine.get_fabric_engine(),
             worker_cpu,
+            num_slots,
         )?;
         Ok(Self { ctx })
     }
@@ -104,6 +106,7 @@ impl PyAllToAllContext {
     #[allow(clippy::too_many_arguments)]
     fn dispatch_send(
         &mut self,
+        slot: usize,
         num_tokens: usize,
         x_ptr: u64,
         x_stride: usize,
@@ -119,6 +122,7 @@ impl PyAllToAllContext {
     ) -> PyResult<()> {
         self.ctx
             .dispatch_send(
+                slot,
                 num_tokens,
                 x_ptr as *const c_void,
                 x_stride,
@@ -138,6 +142,7 @@ impl PyAllToAllContext {
     #[allow(clippy::too_many_arguments)]
     fn dispatch_recv(
         &mut self,
+        slot: usize,
         out_num_tokens_ptr: u64,
         out_x_ptr: u64,
         out_x_stride: usize,
@@ -148,6 +153,7 @@ impl PyAllToAllContext {
     ) -> PyResult<()> {
         self.ctx
             .dispatch_recv(
+                slot,
                 out_num_tokens_ptr as *mut i32,
                 out_x_ptr as *mut c_void,
                 out_x_stride,
@@ -162,18 +168,20 @@ impl PyAllToAllContext {
     #[allow(clippy::too_many_arguments)]
     fn combine_send(
         &mut self,
+        slot: usize,
         expert_x_ptr: u64,
         expert_x_stride: usize,
         stream: u64,
     ) -> PyResult<()> {
         self.ctx
-            .combine_send(expert_x_ptr as *const c_void, expert_x_stride, stream)
+            .combine_send(slot, expert_x_ptr as *const c_void, expert_x_stride, stream)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     #[allow(clippy::too_many_arguments)]
     fn combine_recv(
         &mut self,
+        slot: usize,
         num_tokens: usize,
         num_recv_tokens: usize,
         expert_y_dtype: ScalarType,
@@ -189,6 +197,7 @@ impl PyAllToAllContext {
     ) -> PyResult<()> {
         self.ctx
             .combine_recv(
+                slot,
                 num_tokens,
                 num_recv_tokens,
                 expert_y_dtype,

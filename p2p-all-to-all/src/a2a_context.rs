@@ -1,8 +1,14 @@
-use std::{ffi::c_void, ptr::null_mut, sync::{Arc, atomic::Ordering}, thread::JoinHandle};
+use std::{
+    ffi::c_void,
+    ptr::null_mut,
+    sync::{Arc, atomic::Ordering},
+    thread::JoinHandle,
+};
 
 use anyhow::{Result, anyhow};
 use cuda_lib::{
     CudaDeviceMemory, cuda_check,
+    gdr::{GdrCopyContext, GdrFlag},
     rt::{CudartError, cudaGetNumSMs},
 };
 use fabric_lib::{TransferEngine, api::MemoryRegionHandle};
@@ -113,9 +119,9 @@ pub struct AllToAllContext {
     node_size: usize,
     world_size: usize,
     device: u8,
-    workspace: DeviceWorkspace,
-    worker: Arc<WorkerState>,
-    thread: Option<JoinHandle<()>>,
+    workspaces: Vec<DeviceWorkspace>,
+    workers: Vec<Arc<WorkerState>>,
+    threads: Vec<JoinHandle<()>>,
     num_blocks: usize,
 }
 
@@ -153,86 +159,113 @@ impl AllToAllContext {
         rank_handles: Vec<AllToAllRankHandle>,
         transfer_engine: Arc<TransferEngine>,
         worker_cpu: Option<u16>,
+        num_slots: usize,
     ) -> Result<Self> {
         // Start the all-to-all worker thread.
         for (i, peer) in rank_handles.iter().enumerate() {
             tracing::info!("Rank#{} Peer#{}: {}", rank, i, peer.address);
         }
 
-        let worker: Arc<WorkerState> = Arc::new(WorkerState::new(
-            hidden_dim,
-            hidden_dim_scale,
-            in_elemsize,
-            out_elemsize,
-            scale_elemsize,
-            max_num_tokens,
-            max_recv_tokens,
-            max_tokens_per_expert,
-            max_private_tokens,
-            num_experts,
-            expert_padding,
-            num_experts_per_token,
-            rank,
-            dp_size,
-            node_size,
-            world_size,
-            num_routed_ptr,
-            num_routed_mr,
-            send_buffer_ptr,
-            send_buffer_mr,
-            recv_buffer_ptr,
-            recv_buffer_mr,
-            device,
-            imm_base,
-            rank_handles,
-            transfer_engine,
-        )?);
+        let num_slots = num_slots.max(1);
+        let tx_ready_context = GdrCopyContext::new()?;
+        let tx_ready = Arc::new(GdrFlag::new(&tx_ready_context)?);
+        tx_ready.set(true);
 
-        // Create the worker thread.
-        let (init_tx, init_rx) = oneshot::channel();
-        let thread = {
+        let mut workers = Vec::with_capacity(num_slots);
+        let mut threads = Vec::with_capacity(num_slots);
+        let mut workspaces = Vec::with_capacity(num_slots);
+
+        for slot_idx in 0..num_slots {
+            let slot_imm_base = imm_base + (slot_idx as u32) * 5;
+            let worker: Arc<WorkerState> = Arc::new(WorkerState::new(
+                hidden_dim,
+                hidden_dim_scale,
+                in_elemsize,
+                out_elemsize,
+                scale_elemsize,
+                max_num_tokens,
+                max_recv_tokens,
+                max_tokens_per_expert,
+                max_private_tokens,
+                num_experts,
+                expert_padding,
+                num_experts_per_token,
+                rank,
+                dp_size,
+                node_size,
+                world_size,
+                num_routed_ptr,
+                num_routed_mr,
+                send_buffer_ptr,
+                send_buffer_mr,
+                recv_buffer_ptr,
+                recv_buffer_mr,
+                device,
+                slot_imm_base,
+                rank_handles.clone(),
+                transfer_engine.clone(),
+                tx_ready.clone(),
+            )?);
+
+            let workspace = DeviceWorkspace::new(
+                num_experts,
+                max_num_tokens,
+                num_experts_per_token,
+                &sync_ptrs,
+                &send_ptrs,
+                &recv_ptrs,
+            )?;
+
+            // Create the worker thread.
+            let (init_tx, init_rx) = oneshot::channel();
             let thread_worker = worker.clone();
-            Some(
-                std::thread::Builder::new()
-                    .name("p2p_all_to_all Worker".to_string())
-                    .spawn(move || {
-                        // Pin to the desired CPU.
-                        tracing::info!("Running worker for cuda:{}", device);
-                        if let Some(cpu) = worker_cpu {
-                            if let Err(e) = pin_cpu(cpu.into()) {
-                                tracing::info!("Failed to pin CPU {}: {:?}", cpu, e);
-                            }
-                            tracing::info!(
-                                "Pinned worker for cuda:{} to CPU {}",
-                                device,
-                                cpu
-                            );
+            let thread = std::thread::Builder::new()
+                .name(format!("p2p_all_to_all Worker[{slot_idx}]"))
+                .spawn(move || {
+                    // Pin to the desired CPU.
+                    tracing::info!(
+                        "Running worker slot {} for cuda:{}",
+                        slot_idx,
+                        device
+                    );
+                    if let Some(cpu) = worker_cpu {
+                        if let Err(e) = pin_cpu(cpu.into()) {
+                            tracing::info!("Failed to pin CPU {}: {:?}", cpu, e);
                         }
+                        tracing::info!(
+                            "Pinned worker slot {} for cuda:{} to CPU {}",
+                            slot_idx,
+                            device,
+                            cpu
+                        );
+                    }
 
-                        // Block until the worker is fully initialized.
-                        if init_tx.send(()).is_err() {
-                            panic!("Failed to send initialization signal");
-                        } else {
-                            tracing::info!("Initialized worker for cuda:{}", device);
-                        }
+                    // Block until the worker is fully initialized.
+                    if init_tx.send(()).is_err() {
+                        panic!("Failed to send initialization signal");
+                    } else {
+                        tracing::info!(
+                            "Initialized worker slot {} for cuda:{}",
+                            slot_idx,
+                            device
+                        );
+                    }
 
-                        // Main loop.
-                        thread_worker.main_loop();
-                        tracing::info!("Stopping worker for cuda:{}", device);
-                    })
-                    .expect("Failed to spawn p2p_all_to_all Worker thread"),
-            )
-        };
-        init_rx.recv()?;
+                    // Main loop.
+                    thread_worker.main_loop();
+                    tracing::info!(
+                        "Stopping worker slot {} for cuda:{}",
+                        slot_idx,
+                        device
+                    );
+                })
+                .expect("Failed to spawn p2p_all_to_all Worker thread");
+            init_rx.recv()?;
 
-        let workspace = DeviceWorkspace::new(
-            num_experts,
-            max_num_tokens,
-            num_experts_per_token,
-            &sync_ptrs,
-            &send_ptrs,
-            &recv_ptrs,
-        )?;
+            workers.push(worker);
+            threads.push(thread);
+            workspaces.push(workspace);
+        }
 
         let num_blocks = cudaGetNumSMs(device)?;
 
@@ -253,9 +286,9 @@ impl AllToAllContext {
             node_size,
             world_size,
             device,
-            workspace,
-            worker,
-            thread,
+            workspaces,
+            workers,
+            threads,
             num_blocks,
         })
     }
@@ -264,18 +297,33 @@ impl AllToAllContext {
         // Stop all work on the worker thread.
         tracing::info!("Stopping worker thread for cuda:{}", self.device);
 
-        self.worker.stop();
-        if let Some(thread) = self.thread.take()
-            && thread.join().is_err()
-        {
-            return Err(anyhow!("Failed to join thread"));
+        for worker in &self.workers {
+            worker.stop();
+        }
+        for thread in self.threads.drain(..) {
+            if thread.join().is_err() {
+                return Err(anyhow!("Failed to join thread"));
+            }
         }
         Ok(())
+    }
+
+    fn worker(&self, slot: usize) -> Result<&Arc<WorkerState>> {
+        self.workers
+            .get(slot)
+            .ok_or_else(|| anyhow!("Invalid all-to-all slot {}", slot))
+    }
+
+    fn workspace_mut(&mut self, slot: usize) -> Result<&mut DeviceWorkspace> {
+        self.workspaces
+            .get_mut(slot)
+            .ok_or_else(|| anyhow!("Invalid all-to-all slot {}", slot))
     }
 
     #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
     pub fn dispatch_send(
         &mut self,
+        slot: usize,
         num_tokens: usize,
         x_ptr: *const c_void,
         x_stride: usize,
@@ -292,46 +340,60 @@ impl AllToAllContext {
         if num_tokens > self.max_num_tokens {
             return Err(anyhow!("Number of tokens exceeds maximum allowed"));
         }
+        let num_blocks = self.num_blocks;
+        let hidden_dim = self.hidden_dim;
+        let hidden_dim_scale = self.hidden_dim_scale;
+        let num_experts = self.num_experts;
+        let num_experts_per_token = self.num_experts_per_token;
+        let max_private_tokens = self.max_private_tokens;
+        let rank = self.rank;
+        let dp_size = self.dp_size;
+        let node_size = self.node_size;
+        let world_size = self.world_size;
+        let in_elemsize = self.in_elemsize;
+        let scale_elemsize = self.scale_elemsize;
+        let worker = self.worker(slot)?.clone();
+        let workspace = self.workspace_mut(slot)?;
 
         cuda_check!(a2a_kernels::a2a_dispatch_send(
-            self.num_blocks,
-            self.hidden_dim,
-            self.hidden_dim_scale,
-            self.num_experts,
-            self.num_experts_per_token,
-            self.max_private_tokens,
-            self.rank,
-            self.dp_size,
-            self.node_size,
-            self.world_size,
+            num_blocks,
+            hidden_dim,
+            hidden_dim_scale,
+            num_experts,
+            num_experts_per_token,
+            max_private_tokens,
+            rank,
+            dp_size,
+            node_size,
+            world_size,
             num_tokens,
             bound_m_ptr,
             x_ptr as *const u8,
-            self.in_elemsize,
+            in_elemsize,
             x_stride,
             x_scale_ptr as *const u8,
-            self.scale_elemsize,
+            scale_elemsize,
             x_scale_stride_elem,
             x_scale_stride_token,
             indices,
             indices_stride,
             weights,
             weights_stride,
-            self.workspace.token_offset.get_mut_ptr(),
-            self.worker.buffers.num_routed_ptr,
-            self.workspace.expert_offsets.get_mut_ptr(),
-            self.worker.dispatch_route_done.get_device_ptr(),
-            self.worker.dispatch_send_done.get_device_ptr(),
-            self.worker.tx_ready.get_device_ptr(),
-            self.worker.buffers.send_buffer_ptr as *mut u8,
-            self.workspace.grid_counter.get_mut_ptr(),
-            self.workspace.sync_counter.get_mut_ptr(),
-            self.workspace.get_sync_ptr(),
-            self.workspace.get_recv_ptr() as *mut *mut u8,
+            workspace.token_offset.get_mut_ptr(),
+            worker.buffers.num_routed_ptr,
+            workspace.expert_offsets.get_mut_ptr(),
+            worker.slot.dispatch_route_done.get_device_ptr(),
+            worker.slot.dispatch_send_done.get_device_ptr(),
+            worker.tx_ready.get_device_ptr(),
+            worker.buffers.send_buffer_ptr as *mut u8,
+            workspace.grid_counter.get_mut_ptr(),
+            workspace.sync_counter.get_mut_ptr(),
+            workspace.get_sync_ptr(),
+            workspace.get_recv_ptr() as *mut *mut u8,
             stream,
         ))?;
 
-        if self.worker.failed() {
+        if worker.failed() {
             return Err(anyhow!("fabric-lib transfer error"));
         }
         Ok(())
@@ -340,6 +402,7 @@ impl AllToAllContext {
     #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
     pub fn dispatch_recv(
         &mut self,
+        slot: usize,
         out_num_tokens_ptr: *mut i32,
         out_x_ptr: *mut c_void,
         out_x_stride: usize,
@@ -348,42 +411,55 @@ impl AllToAllContext {
         out_x_scale_stride_token: usize,
         stream: u64,
     ) -> Result<()> {
+        let num_blocks = self.num_blocks;
+        let hidden_dim = self.hidden_dim;
+        let hidden_dim_scale = self.hidden_dim_scale;
+        let in_elemsize = self.in_elemsize;
+        let scale_elemsize = self.scale_elemsize;
+        let num_experts = self.num_experts;
+        let rank = self.rank;
+        let dp_size = self.dp_size;
+        let node_size = self.node_size;
+        let world_size = self.world_size;
+        let worker = self.worker(slot)?.clone();
+        let workspace = self.workspace_mut(slot)?;
+
         cuda_check!(a2a_kernels::a2a_dispatch_recv(
-            self.num_blocks,
-            self.hidden_dim,
-            self.hidden_dim_scale,
-            self.in_elemsize,
-            self.scale_elemsize,
-            self.num_experts,
-            self.rank,
-            self.dp_size,
-            self.node_size,
-            self.world_size,
+            num_blocks,
+            hidden_dim,
+            hidden_dim_scale,
+            in_elemsize,
+            scale_elemsize,
+            num_experts,
+            rank,
+            dp_size,
+            node_size,
+            world_size,
             out_num_tokens_ptr,
             out_x_ptr as *mut u8,
             out_x_stride,
             out_x_scale_ptr as *mut u8,
             out_x_scale_stride_elem,
             out_x_scale_stride_token,
-            self.worker.tokens_per_expert.get_device_ptr(),
-            self.worker.buffers.send_buffer_ptr as *mut u8,
-            self.worker.buffers.recv_buffer_ptr as *mut u8,
-            self.worker.source_rank.get_device_ptr(),
-            self.worker.source_dispatch_offset.get_device_ptr(),
-            self.worker.padded_index.get_device_ptr(),
-            self.worker.buffers.num_routed_ptr,
-            self.worker.num_recv_tokens.get_device_ptr(),
-            self.worker.num_recv_tokens_flag.get_device_ptr(),
-            self.worker.dispatch_recv_flag.get_device_ptr(),
-            self.worker.dispatch_recv_done.get_device_ptr(),
-            self.workspace.grid_counter.get_mut_ptr(),
-            self.workspace.sync_counter.get_mut_ptr(),
-            self.workspace.get_sync_ptr(),
-            self.workspace.get_send_ptr() as *mut *mut u8,
+            worker.slot.tokens_per_expert.get_device_ptr(),
+            worker.buffers.send_buffer_ptr as *mut u8,
+            worker.buffers.recv_buffer_ptr as *mut u8,
+            worker.slot.source_rank.get_device_ptr(),
+            worker.slot.source_dispatch_offset.get_device_ptr(),
+            worker.slot.padded_index.get_device_ptr(),
+            worker.buffers.num_routed_ptr,
+            worker.slot.num_recv_tokens.get_device_ptr(),
+            worker.slot.num_recv_tokens_flag.get_device_ptr(),
+            worker.slot.dispatch_recv_flag.get_device_ptr(),
+            worker.slot.dispatch_recv_done.get_device_ptr(),
+            workspace.grid_counter.get_mut_ptr(),
+            workspace.sync_counter.get_mut_ptr(),
+            workspace.get_sync_ptr(),
+            workspace.get_send_ptr() as *mut *mut u8,
             stream,
         ))?;
 
-        if self.worker.failed() {
+        if worker.failed() {
             return Err(anyhow!("fabric-lib transfer error"));
         }
 
@@ -397,35 +473,45 @@ impl AllToAllContext {
     )]
     pub fn combine_send(
         &mut self,
+        slot: usize,
         expert_x_ptr: *const c_void,
         expert_x_stride: usize,
         stream: u64,
     ) -> Result<()> {
+        let num_blocks = self.num_blocks;
+        let hidden_dim = self.hidden_dim;
+        let out_elemsize = self.out_elemsize;
+        let rank = self.rank;
+        let node_size = self.node_size;
+        let dp_size = self.dp_size;
+        let worker = self.worker(slot)?.clone();
+        let workspace = self.workspace_mut(slot)?;
+
         cuda_check!(a2a_kernels::a2a_combine_send(
-            self.num_blocks,
-            self.hidden_dim,
-            self.out_elemsize,
-            self.rank,
-            self.node_size,
-            self.dp_size,
+            num_blocks,
+            hidden_dim,
+            out_elemsize,
+            rank,
+            node_size,
+            dp_size,
             expert_x_ptr as *const u8,
             expert_x_stride,
-            self.worker.tx_ready.get_device_ptr(),
-            self.worker.buffers.send_buffer_ptr as *mut u8,
-            self.worker.buffers.recv_buffer_ptr as *mut u8,
-            self.worker.source_rank.get_device_ptr(),
-            self.worker.combine_send_offset.get_device_ptr(),
-            self.worker.padded_index.get_device_ptr(),
-            self.worker.num_recv_tokens.get_device_ptr(),
-            self.worker.combine_send_done.get_device_ptr(),
-            self.workspace.token_counter.get_mut_ptr(),
-            self.workspace.sync_counter.get_mut_ptr(),
-            self.workspace.get_sync_ptr(),
-            self.workspace.get_recv_ptr() as *mut *mut u8,
+            worker.tx_ready.get_device_ptr(),
+            worker.buffers.send_buffer_ptr as *mut u8,
+            worker.buffers.recv_buffer_ptr as *mut u8,
+            worker.slot.source_rank.get_device_ptr(),
+            worker.slot.combine_send_offset.get_device_ptr(),
+            worker.slot.padded_index.get_device_ptr(),
+            worker.slot.num_recv_tokens.get_device_ptr(),
+            worker.slot.combine_send_done.get_device_ptr(),
+            workspace.token_counter.get_mut_ptr(),
+            workspace.sync_counter.get_mut_ptr(),
+            workspace.get_sync_ptr(),
+            workspace.get_recv_ptr() as *mut *mut u8,
             stream,
         ))?;
 
-        if self.worker.failed() {
+        if worker.failed() {
             return Err(anyhow!("fabric-lib transfer error"));
         }
 
@@ -439,6 +525,7 @@ impl AllToAllContext {
     )]
     pub fn combine_recv(
         &mut self,
+        slot: usize,
         num_tokens: usize,
         num_recv_tokens: usize,
         expert_y_dtype: ScalarType,
@@ -452,17 +539,29 @@ impl AllToAllContext {
         accumulate: bool,
         stream: u64,
     ) -> Result<()> {
+        let num_blocks = self.num_blocks;
+        let hidden_dim = self.hidden_dim;
+        let out_elemsize = self.out_elemsize;
+        let out_dtype = self.out_dtype;
+        let num_experts = self.num_experts;
+        let num_experts_per_token = self.num_experts_per_token;
+        let rank = self.rank;
+        let node_size = self.node_size;
+        let world_size = self.world_size;
+        let worker = self.worker(slot)?.clone();
+        let workspace = self.workspace_mut(slot)?;
+
         cuda_check!(a2a_kernels::a2a_combine_recv(
-            self.num_blocks,
-            self.hidden_dim,
-            self.out_elemsize,
+            num_blocks,
+            hidden_dim,
+            out_elemsize,
             expert_y_dtype,
-            self.out_dtype,
-            self.num_experts,
-            self.num_experts_per_token,
-            self.rank,
-            self.node_size,
-            self.world_size,
+            out_dtype,
+            num_experts,
+            num_experts_per_token,
+            rank,
+            node_size,
+            world_size,
             num_tokens,
             bound_m_ptr,
             indices_ptr,
@@ -472,17 +571,17 @@ impl AllToAllContext {
             out_tokens_ptr as *mut u8,
             out_tokens_stride,
             accumulate,
-            self.worker.buffers.recv_buffer_ptr as *mut u8,
-            self.workspace.token_offset.get_mut_ptr(),
-            self.workspace.expert_offsets.get_mut_ptr(),
-            self.worker.combine_recv_flag.get_device_ptr(),
-            self.worker.combine_recv_done.get_device_ptr(),
-            self.workspace.sync_counter.get_mut_ptr(),
-            self.workspace.get_sync_ptr(),
+            worker.buffers.recv_buffer_ptr as *mut u8,
+            workspace.token_offset.get_mut_ptr(),
+            workspace.expert_offsets.get_mut_ptr(),
+            worker.slot.combine_recv_flag.get_device_ptr(),
+            worker.slot.combine_recv_done.get_device_ptr(),
+            workspace.sync_counter.get_mut_ptr(),
+            workspace.get_sync_ptr(),
             stream,
         ))?;
 
-        if self.worker.failed() {
+        if worker.failed() {
             return Err(anyhow!("fabric-lib transfer error"));
         }
 
@@ -490,16 +589,45 @@ impl AllToAllContext {
     }
 
     pub fn get_perf_stats(&self) -> AllToAllPerfStats {
-        AllToAllPerfStats {
-            local_dispatch_bytes: self.worker.accumulated_local_dispatch_bytes.load(Ordering::Relaxed),
-            nvlink_dispatch_bytes: self.worker.accumulated_nvlink_dispatch_bytes.load(Ordering::Relaxed),
-            network_dispatch_bytes: self.worker.accumulated_network_dispatch_bytes.load(Ordering::Relaxed),
-            local_combine_bytes: self.worker.accumulated_local_combine_bytes.load(Ordering::Relaxed),
-            nvlink_combine_bytes: self.worker.accumulated_nvlink_combine_bytes.load(Ordering::Relaxed),
-            network_combine_bytes: self.worker.accumulated_network_combine_bytes.load(Ordering::Relaxed),
-            peer_dispatch_bytes: self.worker.peer_dispatch_bytes.iter().map(|v| v.load(Ordering::Relaxed)).collect(),
-            peer_combine_bytes: self.worker.peer_combine_bytes.iter().map(|v| v.load(Ordering::Relaxed)).collect(),
+        let mut stats = AllToAllPerfStats {
+            local_dispatch_bytes: 0,
+            nvlink_dispatch_bytes: 0,
+            network_dispatch_bytes: 0,
+            local_combine_bytes: 0,
+            nvlink_combine_bytes: 0,
+            network_combine_bytes: 0,
+            peer_dispatch_bytes: vec![0; self.world_size],
+            peer_combine_bytes: vec![0; self.world_size],
+        };
+        for worker in &self.workers {
+            stats.local_dispatch_bytes +=
+                worker.accumulated_local_dispatch_bytes.load(Ordering::Relaxed);
+            stats.nvlink_dispatch_bytes +=
+                worker.accumulated_nvlink_dispatch_bytes.load(Ordering::Relaxed);
+            stats.network_dispatch_bytes +=
+                worker.accumulated_network_dispatch_bytes.load(Ordering::Relaxed);
+            stats.local_combine_bytes +=
+                worker.accumulated_local_combine_bytes.load(Ordering::Relaxed);
+            stats.nvlink_combine_bytes +=
+                worker.accumulated_nvlink_combine_bytes.load(Ordering::Relaxed);
+            stats.network_combine_bytes +=
+                worker.accumulated_network_combine_bytes.load(Ordering::Relaxed);
+            for (dst, value) in stats
+                .peer_dispatch_bytes
+                .iter_mut()
+                .zip(worker.peer_dispatch_bytes.iter())
+            {
+                *dst += value.load(Ordering::Relaxed);
+            }
+            for (dst, value) in stats
+                .peer_combine_bytes
+                .iter_mut()
+                .zip(worker.peer_combine_bytes.iter())
+            {
+                *dst += value.load(Ordering::Relaxed);
+            }
         }
+        stats
     }
 }
 

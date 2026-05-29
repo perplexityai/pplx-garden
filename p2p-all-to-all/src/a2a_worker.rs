@@ -53,6 +53,77 @@ unsafe impl Send for WorkerBuffers {}
 unsafe impl Sync for WorkerBuffers {}
 
 #[allow(dead_code)]
+pub(crate) struct MicrobatchSlot {
+    pub(crate) dispatch_route_done: GdrFlag,
+    pub(crate) dispatch_send_done: GdrFlag,
+    pub(crate) dispatch_recv_done: GdrFlag,
+    pub(crate) combine_send_done: GdrFlag,
+    pub(crate) combine_recv_done: GdrFlag,
+    pub(crate) tokens_per_expert: GdrVec<u32>,
+    pub(crate) source_dispatch_offset: GdrVec<u32>,
+    pub(crate) combine_send_offset: GdrVec<u32>,
+    pub(crate) source_rank: GdrVec<u32>,
+    pub(crate) padded_index: GdrVec<u32>,
+    pub(crate) num_recv_tokens: GdrVec<u32>,
+    pub(crate) num_recv_tokens_flag: GdrFlag,
+    pub(crate) dispatch_recv_flag: Arc<GdrFlag>,
+    pub(crate) combine_recv_flag: Arc<GdrFlag>,
+}
+
+impl MicrobatchSlot {
+    fn new(
+        gdr_context: &GdrCopyContext,
+        num_local_experts: usize,
+        max_recv_tokens: usize,
+    ) -> Result<Self> {
+        let dispatch_route_done = GdrFlag::new(gdr_context)?;
+        let dispatch_send_done = GdrFlag::new(gdr_context)?;
+        let dispatch_recv_done = GdrFlag::new(gdr_context)?;
+        let combine_send_done = GdrFlag::new(gdr_context)?;
+        let combine_recv_done = GdrFlag::new(gdr_context)?;
+        let num_recv_tokens_flag = GdrFlag::new(gdr_context)?;
+        let dispatch_recv_flag = Arc::new(GdrFlag::new(gdr_context)?);
+        let combine_recv_flag = Arc::new(GdrFlag::new(gdr_context)?);
+
+        let tokens_per_expert = GdrVec::new(gdr_context, num_local_experts)?;
+        let source_rank = GdrVec::new(gdr_context, max_recv_tokens)?;
+        let source_dispatch_offset = GdrVec::new(gdr_context, max_recv_tokens)?;
+        let combine_send_offset = GdrVec::new(gdr_context, max_recv_tokens)?;
+        let padded_index = GdrVec::new(gdr_context, max_recv_tokens)?;
+        let num_recv_tokens = GdrVec::new(gdr_context, 3)?;
+
+        num_recv_tokens.copy(&[0u32, 0u32, 0u32]);
+        num_recv_tokens_flag.set(false);
+        dispatch_recv_flag.set(false);
+        combine_recv_flag.set(false);
+
+        Ok(Self {
+            dispatch_route_done,
+            dispatch_send_done,
+            dispatch_recv_done,
+            combine_send_done,
+            combine_recv_done,
+            tokens_per_expert,
+            source_dispatch_offset,
+            combine_send_offset,
+            source_rank,
+            padded_index,
+            num_recv_tokens,
+            num_recv_tokens_flag,
+            dispatch_recv_flag,
+            combine_recv_flag,
+        })
+    }
+
+    fn stop(&self) {
+        self.dispatch_route_done.set(true);
+        self.dispatch_send_done.set(true);
+        self.dispatch_recv_done.set(true);
+        self.combine_send_done.set(true);
+        self.combine_recv_done.set(true);
+    }
+}
+
 pub(crate) struct WorkerState {
     transfer_engine: Arc<TransferEngine>,
     max_num_tokens: usize,
@@ -85,21 +156,8 @@ pub(crate) struct WorkerState {
     send_buffer_mr: MemoryRegionHandle,
     recv_buffer_mr: MemoryRegionHandle,
     pub(crate) buffers: WorkerBuffers,
-    pub(crate) dispatch_route_done: GdrFlag,
-    pub(crate) dispatch_send_done: GdrFlag,
-    pub(crate) dispatch_recv_done: GdrFlag,
-    pub(crate) combine_send_done: GdrFlag,
-    pub(crate) combine_recv_done: GdrFlag,
-    pub(crate) tokens_per_expert: GdrVec<u32>,
-    pub(crate) source_dispatch_offset: GdrVec<u32>,
-    pub(crate) combine_send_offset: GdrVec<u32>,
-    pub(crate) source_rank: GdrVec<u32>,
-    pub(crate) padded_index: GdrVec<u32>,
-    pub(crate) num_recv_tokens: GdrVec<u32>,
-    pub(crate) num_recv_tokens_flag: GdrFlag,
-    pub(crate) dispatch_recv_flag: Arc<GdrFlag>,
-    pub(crate) combine_recv_flag: Arc<GdrFlag>,
-    pub(crate) tx_ready: GdrFlag,
+    pub(crate) slot: MicrobatchSlot,
+    pub(crate) tx_ready: Arc<GdrFlag>,
     route_counter: ImmCounter,
     dispatch_counter: GdrCounter,
     combine_counter: ImmCounter,
@@ -156,6 +214,7 @@ impl WorkerState {
         imm_base: u32,
         rank_handles: Vec<AllToAllRankHandle>,
         transfer_engine: Arc<TransferEngine>,
+        tx_ready: Arc<GdrFlag>,
     ) -> Result<Self> {
         let dp_rank = rank % dp_size;
         let dp_group = rank / dp_size;
@@ -163,35 +222,14 @@ impl WorkerState {
 
         let gdr_context = GdrCopyContext::new()?;
 
-        let dispatch_route_done = GdrFlag::new(&gdr_context)?;
-        let dispatch_send_done = GdrFlag::new(&gdr_context)?;
-        let dispatch_recv_done = GdrFlag::new(&gdr_context)?;
-        let combine_send_done = GdrFlag::new(&gdr_context)?;
-        let combine_recv_done = GdrFlag::new(&gdr_context)?;
-        let num_recv_tokens_flag = GdrFlag::new(&gdr_context)?;
-        let tx_ready = GdrFlag::new(&gdr_context)?;
-        let dispatch_recv_flag = Arc::new(GdrFlag::new(&gdr_context)?);
-        let combine_recv_flag = Arc::new(GdrFlag::new(&gdr_context)?);
-
-        let tokens_per_expert = GdrVec::new(&gdr_context, num_local_experts)?;
-        let source_rank = GdrVec::new(&gdr_context, max_recv_tokens)?;
-        let source_dispatch_offset = GdrVec::new(&gdr_context, max_recv_tokens)?;
-        let combine_send_offset = GdrVec::new(&gdr_context, max_recv_tokens)?;
-        let padded_index = GdrVec::new(&gdr_context, max_recv_tokens)?;
-        let num_recv_tokens = GdrVec::new(&gdr_context, 3)?;
-
-        num_recv_tokens.copy(&[0u32, 0u32, 0u32]);
-        num_recv_tokens_flag.set(false);
-        dispatch_recv_flag.set(false);
-        combine_recv_flag.set(false);
-        tx_ready.set(true);
-
+        let slot =
+            MicrobatchSlot::new(&gdr_context, num_local_experts, max_recv_tokens)?;
         // Set up the immediate counters.
         let route_imm = imm_base;
         let route_counter = transfer_engine.get_imm_counter(route_imm);
         let dispatch_imm = imm_base + 1;
-        let dispatch_counter =
-            transfer_engine.get_gdr_counter(dispatch_imm, dispatch_recv_flag.clone());
+        let dispatch_counter = transfer_engine
+            .get_gdr_counter(dispatch_imm, slot.dispatch_recv_flag.clone());
         let combine_imm = imm_base + 2;
         let combine_counter = transfer_engine.get_imm_counter(combine_imm);
         let dispatch_barrier_imm = imm_base + 3;
@@ -290,23 +328,10 @@ impl WorkerState {
             dispatch_barrier_imm,
             combine_barrier_imm,
             buffers: WorkerBuffers { num_routed_ptr, send_buffer_ptr, recv_buffer_ptr },
-            dispatch_route_done,
-            dispatch_send_done,
-            dispatch_recv_done,
-            combine_send_done,
-            combine_recv_done,
             num_routed_mr,
             send_buffer_mr,
             recv_buffer_mr,
-            tokens_per_expert,
-            source_rank,
-            source_dispatch_offset,
-            combine_send_offset,
-            padded_index,
-            num_recv_tokens,
-            num_recv_tokens_flag,
-            dispatch_recv_flag,
-            combine_recv_flag,
+            slot,
             tx_ready,
             route_counter,
             dispatch_counter,
@@ -335,11 +360,8 @@ impl WorkerState {
 
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::Relaxed);
-        self.dispatch_route_done.set(true);
-        self.dispatch_send_done.set(true);
-        self.dispatch_recv_done.set(true);
-        self.combine_send_done.set(true);
-        self.combine_recv_done.set(true);
+        self.slot.stop();
+        self.tx_ready.set(true);
     }
 
     fn get_num_routed(&self, dp_group: usize, expert: usize) -> u32 {
@@ -382,7 +404,7 @@ impl WorkerState {
 
     fn step(&self) {
         // Wait for the device to copy the routing info to the host.
-        self.dispatch_route_done.wait();
+        self.slot.dispatch_route_done.wait();
         if !self.is_running() {
             return;
         }
@@ -397,7 +419,7 @@ impl WorkerState {
             .unwrap();
 
         // Wait for the dispatch kernel to copy tokens into send buffers.
-        self.dispatch_send_done.wait();
+        self.slot.dispatch_send_done.wait();
         self.tx_ready.set(false);
         if !self.is_running() {
             return;
@@ -448,7 +470,7 @@ impl WorkerState {
 
             // Wait for the dispatch kernel to complete. It is triggered once
             // the immediate counter reaches zero by setting the dispatch recv flag.
-            self.dispatch_recv_done.wait();
+            self.slot.dispatch_recv_done.wait();
 
             range_end!(dispatch_range);
         }
@@ -462,7 +484,7 @@ impl WorkerState {
 
         // Combine stage.
         {
-            self.combine_send_done.wait();
+            self.slot.combine_send_done.wait();
             if !self.is_running() {
                 return;
             }
@@ -490,10 +512,10 @@ impl WorkerState {
             if !self.wait_imm(&self.combine_counter, num_combine_imm) {
                 return;
             }
-            self.combine_recv_flag.set(true);
+            self.slot.combine_recv_flag.set(true);
 
             // Let the recv phase output the tokens and proceed forward.
-            self.combine_recv_done.wait();
+            self.slot.combine_recv_done.wait();
 
             range_end!(combine_range);
         }
@@ -645,7 +667,7 @@ impl WorkerState {
                 }
             }
         }
-        self.tokens_per_expert.copy(&tokens_per_expert);
+        self.slot.tokens_per_expert.copy(&tokens_per_expert);
 
         // Compute the output row base for each local expert. In the default compact
         // layout, experts are tightly packed with optional padding. In batched
@@ -746,13 +768,14 @@ impl WorkerState {
         route_group(self.dp_group);
 
         // Copy the buffers to the device.
-        self.padded_index.copy(&padded_index);
-        self.source_rank.copy(&source_rank);
-        self.source_dispatch_offset.copy(&source_dispatch_offset);
-        self.combine_send_offset.copy(&combine_send_offset);
-        self.num_recv_tokens
+        self.slot.padded_index.copy(&padded_index);
+        self.slot.source_rank.copy(&source_rank);
+        self.slot.source_dispatch_offset.copy(&source_dispatch_offset);
+        self.slot.combine_send_offset.copy(&combine_send_offset);
+        self.slot
+            .num_recv_tokens
             .copy(&[num_recv_tokens as u32, num_recv_efa_tokens as u32]);
-        self.num_recv_tokens_flag.set(true);
+        self.slot.num_recv_tokens_flag.set(true);
 
         // Prepare the dispatch commands, beyond the private recv buffers.
         let mut dispatch_ranges = Vec::with_capacity(self.world_size - 1);
@@ -802,10 +825,8 @@ impl WorkerState {
                 let peer_rank = peer_group * self.dp_size + self.dp_rank;
                 let length = token_dim * tokens_from_group[peer_group] as usize;
 
-                let src_offset =
-                    src_group_offset[peer_group] as u64 * token_dim as u64;
-                let dst_offset =
-                    dst_group_offset[peer_group] as u64 * token_dim as u64;
+                let src_offset = src_group_offset[peer_group] as u64 * token_dim as u64;
+                let dst_offset = dst_group_offset[peer_group] as u64 * token_dim as u64;
 
                 let dst_mr = self.rank_handles[peer_rank].recv_buffer_desc.clone();
                 combine_ranges.push(ScatterTarget {
@@ -822,13 +843,17 @@ impl WorkerState {
             let dispatch_tokens = tokens_to_rank[peer_rank] as u64;
             let dispatch_bytes = dispatch_tokens * self.get_dispatch_token_dim() as u64;
             if dispatch_bytes > 0 {
-                self.peer_dispatch_bytes[peer_rank].fetch_add(dispatch_bytes, Ordering::Relaxed);
+                self.peer_dispatch_bytes[peer_rank]
+                    .fetch_add(dispatch_bytes, Ordering::Relaxed);
                 if peer_rank == self.rank {
-                    self.accumulated_local_dispatch_bytes.fetch_add(dispatch_bytes, Ordering::Relaxed);
+                    self.accumulated_local_dispatch_bytes
+                        .fetch_add(dispatch_bytes, Ordering::Relaxed);
                 } else if peer_rank / self.node_size == rank_node {
-                    self.accumulated_nvlink_dispatch_bytes.fetch_add(dispatch_bytes, Ordering::Relaxed);
+                    self.accumulated_nvlink_dispatch_bytes
+                        .fetch_add(dispatch_bytes, Ordering::Relaxed);
                 } else {
-                    self.accumulated_network_dispatch_bytes.fetch_add(dispatch_bytes, Ordering::Relaxed);
+                    self.accumulated_network_dispatch_bytes
+                        .fetch_add(dispatch_bytes, Ordering::Relaxed);
                 }
             }
         }
@@ -838,13 +863,17 @@ impl WorkerState {
             let combine_tokens = tokens_from_group[peer_group] as u64;
             let combine_bytes = combine_tokens * self.get_combine_token_dim() as u64;
             if combine_bytes > 0 {
-                self.peer_combine_bytes[peer_rank].fetch_add(combine_bytes, Ordering::Relaxed);
+                self.peer_combine_bytes[peer_rank]
+                    .fetch_add(combine_bytes, Ordering::Relaxed);
                 if peer_rank == self.rank {
-                    self.accumulated_local_combine_bytes.fetch_add(combine_bytes, Ordering::Relaxed);
+                    self.accumulated_local_combine_bytes
+                        .fetch_add(combine_bytes, Ordering::Relaxed);
                 } else if peer_rank / self.node_size == rank_node {
-                    self.accumulated_nvlink_combine_bytes.fetch_add(combine_bytes, Ordering::Relaxed);
+                    self.accumulated_nvlink_combine_bytes
+                        .fetch_add(combine_bytes, Ordering::Relaxed);
                 } else {
-                    self.accumulated_network_combine_bytes.fetch_add(combine_bytes, Ordering::Relaxed);
+                    self.accumulated_network_combine_bytes
+                        .fetch_add(combine_bytes, Ordering::Relaxed);
                 }
             }
         }

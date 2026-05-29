@@ -1,5 +1,6 @@
 use fabric_lib::api::{DomainAddress, MemoryRegionDescriptor};
 
+#[derive(Clone)]
 pub struct AllToAllRankHandle {
     pub address: DomainAddress,
     pub num_routed_desc: MemoryRegionDescriptor,

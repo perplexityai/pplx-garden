@@ -52,9 +52,11 @@ class AllToAllContext:
         ],
         transfer_engine: TransferEngine,
         worker_cpu: int | None,
+        num_slots: int,
     ) -> None: ...
     def dispatch_send(
         self,
+        slot: int,
         num_tokens: int,
         x_ptr: int,
         x_stride: int,
@@ -70,6 +72,7 @@ class AllToAllContext:
     ) -> None: ...
     def dispatch_recv(
         self,
+        slot: int,
         out_num_tokens_ptr: int,
         out_x_ptr: int,
         out_x_stride: int,
@@ -80,12 +83,14 @@ class AllToAllContext:
     ) -> None: ...
     def combine_send(
         self,
+        slot: int,
         expert_x_ptr: int,
         expert_x_stride: int,
         stream: int,
     ) -> None: ...
     def combine_recv(
         self,
+        slot: int,
         num_tokens: int,
         num_recv_tokens: int,
         expert_y_dtype: torch.dtype,
