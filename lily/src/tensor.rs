@@ -43,6 +43,21 @@ impl Tensor {
         Ok(Self { buf, shape: shape.to_vec(), dtype, offset: 0 })
     }
 
+    /// Allocates a tensor without touching its contents.
+    ///
+    /// Callers must ensure every element is written before it is read. This is
+    /// intentionally crate-private so ordinary scratch/state tensors continue
+    /// to use [`Self::zeros`].
+    pub(crate) fn uninitialized(
+        ctx: &MetalContext,
+        shape: &[usize],
+        dtype: DType,
+    ) -> Result<Self> {
+        let numel: usize = shape.iter().product();
+        let buf = ctx.new_uninitialized_buffer(numel * dtype.size())?;
+        Ok(Self { buf, shape: shape.to_vec(), dtype, offset: 0 })
+    }
+
     /// Wraps an existing buffer (e.g. one filled directly from a checkpoint
     /// read) as a tensor.
     pub fn from_buffer(buf: Buffer, shape: &[usize], dtype: DType) -> Result<Self> {
