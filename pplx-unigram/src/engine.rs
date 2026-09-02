@@ -55,10 +55,14 @@ impl Engine {
                 state.tokens.push(special_id);
                 continue;
             }
-            if segment.start == segment.end {
-                continue;
+            // `WhitespaceSplit` runs ahead of `Metaspace` in the pre-tokenizer
+            // sequence: whitespace is a separator, not content, so runs of it
+            // are dropped rather than turned into lone replacement characters.
+            // Each word is decoded on its own, which also stops a vocab entry
+            // that spans a word boundary from ever being matched.
+            for word in normalized[segment.start..segment.end].split_whitespace() {
+                self.encode_word(word, state)?;
             }
-            self.encode_text_segment(&normalized[segment.start..segment.end], state)?;
         }
 
         // Both `normalize_into` and `split` clear their output at the top, so
@@ -68,16 +72,13 @@ impl Engine {
         Ok(())
     }
 
-    fn encode_text_segment(&self, text: &str, state: &mut EncodeState) -> Result<()> {
+    fn encode_word(&self, word: &str, state: &mut EncodeState) -> Result<()> {
         let mut prep = std::mem::take(&mut state.prep);
-        self.components.metaspace.encode_into(text, &mut prep);
-        let prep_len = prep.len();
+        self.components.metaspace.encode_word_into(word, &mut prep);
 
-        ensure_dp_capacity(state, prep_len + 1);
-
-        if prep_len > 0 {
-            self.viterbi(&prep, state)?;
-        }
+        // `split_whitespace` never yields an empty word, so `prep` is non-empty.
+        ensure_dp_capacity(state, prep.len() + 1);
+        self.viterbi(&prep, state)?;
 
         prep.clear();
         state.prep = prep;
@@ -152,7 +153,7 @@ impl Engine {
         let original_len = state.tokens.len();
         let unk_id = self.components.unk_id;
         for &token_id in state.backtrack.iter().rev() {
-            // Fuse consecutive UNKs within a single text segment.
+            // Fuse consecutive UNKs within a single word.
             let should_fuse_unk = token_id == unk_id
                 && state.tokens.len() > original_len
                 && state.tokens.last().copied() == Some(unk_id);

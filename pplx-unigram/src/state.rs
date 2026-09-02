@@ -11,7 +11,8 @@ use crate::TokenId;
 /// 1. `tokens` is reset and ultimately holds the result the caller reads.
 /// 2. `normalized` gets the normalizer's UTF-8 output for the whole input.
 /// 3. `segments` slices `normalized` around any special-token matches.
-/// 4. For each non-special segment, `prep` gets the metaspace-encoded bytes.
+/// 4. Each non-special segment is split on whitespace and `prep` gets the
+///    metaspace-encoded bytes of one word at a time.
 /// 5. The Viterbi forward pass fills `best_score` / `best_start` / `best_id`
 ///    over `prep`, then the backward pass uses `backtrack` to reverse the
 ///    chosen path before appending it to `tokens`.
@@ -21,7 +22,7 @@ pub struct EncodeState {
     pub tokens: Vec<TokenId>,
     /// Normalized text for the full input (one per call).
     pub normalized: String,
-    /// Metaspace-preprocessed bytes for the current text segment.
+    /// Metaspace-preprocessed bytes for the current word.
     pub prep: Vec<u8>,
     /// Spans of `normalized` separated by special-token matches.
     pub segments: Vec<crate::Segment>,

@@ -1,4 +1,4 @@
-//! Metaspace pre-tokenization.
+//! Metaspace pre-tokenization, applied to one whitespace-delimited word.
 
 use crate::{Error, Result};
 
@@ -38,23 +38,15 @@ impl Metaspace {
         Ok(Self::new(pre.0, pre.1))
     }
 
-    pub fn encode_into(&self, text: &str, out: &mut Vec<u8>) {
+    /// Encodes one word emitted by the preceding `WhitespaceSplit` step.
+    ///
+    /// The word holds no whitespace, so nothing needs substituting: the
+    /// replacement character is purely the prefix that marks a word start.
+    pub fn encode_word_into(&self, word: &str, out: &mut Vec<u8>) {
         out.clear();
-        if text.is_empty() {
-            return;
+        if self.add_prefix_space {
+            out.extend_from_slice(&self.replacement_bytes[..self.replacement_len]);
         }
-        let repl = &self.replacement_bytes[..self.replacement_len];
-        if self.add_prefix_space && !text.starts_with(' ') {
-            out.extend_from_slice(repl);
-        }
-        let mut buf = [0u8; 4];
-        for ch in text.chars() {
-            if ch == ' ' {
-                out.extend_from_slice(repl);
-            } else {
-                let encoded = ch.encode_utf8(&mut buf);
-                out.extend_from_slice(encoded.as_bytes());
-            }
-        }
+        out.extend_from_slice(word.as_bytes());
     }
 }
