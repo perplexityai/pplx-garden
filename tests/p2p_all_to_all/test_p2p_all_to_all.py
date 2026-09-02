@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from pplx_garden.distributed import ParallelGroup, ParallelLaunch
-from pplx_garden.kernels.p2p_all_to_all import P2PAllToAll
+from pplx_garden.kernels.p2p_all_to_all import P2PAllToAll, compute_max_recv_tokens
 from pplx_garden.utils import logging_utils
 from pplx_garden.utils.math import round_up
 from pplx_garden.utils.torch import has_tp
@@ -39,6 +39,8 @@ class _Config:
     scale_dtype: Optional[torch.dtype]
     expert_padding: int
     nvlink_group: Optional[int]
+    recv_buffer_factor: Optional[float] = None
+    max_recv_tokens: Optional[int] = None
 
 
 def _act(x: torch.Tensor, x_scale: Optional[torch.Tensor]) -> torch.Tensor:
@@ -54,6 +56,166 @@ def _generator(device: torch.device, rank: int) -> torch.Generator:
     generator = torch.Generator(device=device)
     generator.manual_seed(rank)
     return generator
+
+
+def _compute_worst_case(
+    *,
+    max_num_tokens: int,
+    num_experts_per_token: int,
+    num_local_experts: int,
+    num_dp_groups: int,
+    max_private_tokens: int,
+    expert_padding: int,
+    **_: object,
+) -> int:
+    """Recompute the worst-case bound independently for test assertions."""
+    num_tokens = max_num_tokens * num_dp_groups
+    return max_private_tokens * num_dp_groups + round_up(
+        max(
+            min(
+                num_tokens * num_experts_per_token
+                + num_local_experts * (expert_padding - 1),
+                num_tokens * num_local_experts,
+            ),
+            num_local_experts * expert_padding,
+        ),
+        expert_padding,
+    )
+
+
+def _compute_balanced(
+    *,
+    max_num_tokens: int,
+    num_experts: int,
+    num_experts_per_token: int,
+    num_local_experts: int,
+    num_dp_groups: int,
+    max_private_tokens: int,
+    **_: object,
+) -> int:
+    """Recompute the balanced estimate independently for test assertions."""
+    from pplx_garden.utils.math import ceil_div
+
+    num_tokens = max_num_tokens * num_dp_groups
+    return (
+        ceil_div(num_tokens * num_experts_per_token, num_experts)
+        * num_local_experts
+        + max_private_tokens * num_dp_groups
+    )
+
+
+class TestComputeMaxRecvTokens:
+    """Pure-arithmetic tests for the recv buffer sizing logic."""
+
+    BASE_KWARGS = dict(
+        max_num_tokens=128,
+        num_experts=128,
+        num_experts_per_token=8,
+        num_local_experts=16,
+        num_dp_groups=1,
+        max_private_tokens=24,
+        expert_padding=1,
+    )
+
+    def test_default_uses_worst_case(self):
+        """With no overrides, max_recv_tokens == worst-case bound."""
+        actual = compute_max_recv_tokens(**self.BASE_KWARGS)
+        default = _compute_worst_case(**self.BASE_KWARGS)
+        balanced = _compute_balanced(**self.BASE_KWARGS)
+        assert actual == default
+        assert actual >= balanced
+
+    def test_balanced_less_than_worst_case(self):
+        """Balanced estimate should always be <= worst case."""
+        for topk in [1, 2, 4, 8]:
+            for n_experts in [16, 64, 128, 256]:
+                kwargs = {
+                    **self.BASE_KWARGS,
+                    "num_experts": n_experts,
+                    "num_experts_per_token": topk,
+                    "num_local_experts": max(1, n_experts // 8),
+                }
+                default = _compute_worst_case(**kwargs)
+                balanced = _compute_balanced(**kwargs)
+                assert balanced <= default, (
+                    f"balanced ({balanced}) > default ({default}) "
+                    f"for topk={topk}, num_experts={n_experts}"
+                )
+
+    def test_factor_scales_balanced_estimate(self):
+        """recv_buffer_factor * balanced should give the result."""
+        factor = 2.0
+        actual = compute_max_recv_tokens(
+            **self.BASE_KWARGS,
+            recv_buffer_factor=factor,
+        )
+        balanced = _compute_balanced(**self.BASE_KWARGS)
+        default = _compute_worst_case(**self.BASE_KWARGS)
+        # expert_padding=1 so round_up is a no-op.
+        assert actual == int(balanced * factor)
+        assert actual <= default
+
+    def test_factor_one_equals_balanced(self):
+        """Factor of 1.0 should produce exactly the balanced estimate."""
+        actual = compute_max_recv_tokens(
+            **self.BASE_KWARGS,
+            recv_buffer_factor=1.0,
+        )
+        balanced = _compute_balanced(**self.BASE_KWARGS)
+        assert actual == balanced
+
+    def test_factor_clamped_to_worst_case(self):
+        """Even a huge factor should not exceed the worst-case bound."""
+        actual = compute_max_recv_tokens(
+            **self.BASE_KWARGS,
+            recv_buffer_factor=100.0,
+        )
+        default = _compute_worst_case(**self.BASE_KWARGS)
+        assert actual == default
+
+    def test_factor_respects_expert_padding(self):
+        """Result should be aligned to expert_padding."""
+        kwargs = {**self.BASE_KWARGS, "expert_padding": 16}
+        actual = compute_max_recv_tokens(
+            **kwargs,
+            recv_buffer_factor=1.5,
+        )
+        assert actual % 16 == 0
+
+    def test_override_used_directly(self):
+        """Explicit override should be returned as-is when within bounds."""
+        actual = compute_max_recv_tokens(
+            **self.BASE_KWARGS,
+            max_recv_tokens_override=500,
+        )
+        default = _compute_worst_case(**self.BASE_KWARGS)
+        assert actual == 500
+        assert actual <= default
+
+    def test_override_clamped_to_worst_case(self):
+        """Override exceeding worst-case should be clamped."""
+        actual = compute_max_recv_tokens(
+            **self.BASE_KWARGS,
+            max_recv_tokens_override=999_999_999,
+        )
+        default = _compute_worst_case(**self.BASE_KWARGS)
+        assert actual == default
+
+    def test_override_takes_priority_over_factor(self):
+        """max_recv_tokens_override wins over recv_buffer_factor."""
+        actual = compute_max_recv_tokens(
+            **self.BASE_KWARGS,
+            max_recv_tokens_override=500,
+            recv_buffer_factor=2.0,
+        )
+        assert actual == 500
+
+    def test_multi_dp_group_increases_buffer(self):
+        """More DP groups should increase both balanced and worst-case."""
+        kwargs_1 = {**self.BASE_KWARGS, "num_dp_groups": 1}
+        kwargs_4 = {**self.BASE_KWARGS, "num_dp_groups": 4}
+        assert _compute_worst_case(**kwargs_4) > _compute_worst_case(**kwargs_1)
+        assert _compute_balanced(**kwargs_4) > _compute_balanced(**kwargs_1)
 
 
 def _test_p2p_all_to_all_worker(
@@ -128,6 +290,8 @@ def _test_p2p_all_to_all_worker(
         dp_group=tp_group,
         node_group=node_group,
         global_group=global_group,
+        recv_buffer_factor=config.recv_buffer_factor,
+        max_recv_tokens=config.max_recv_tokens,
     )
 
     try:
@@ -547,6 +711,78 @@ def _test_p2p_all_to_all_worker(
             ),
             marks=[pytest.mark.skipif(not has_tp(2), reason="Requires 2 devices")],
             id="TP2-EMPTY",
+        ),
+        pytest.param(
+            _Config(
+                world_size=2,
+                dp_size=1,
+                nets_per_gpu=1,
+                max_num_tokens=128,
+                num_experts=16,
+                hidden_dim=128,
+                hidden_dim_scale=None,
+                num_experts_per_token=2,
+                max_private_tokens=None,
+                in_dtype=torch.float32,
+                out_dtype=torch.float32,
+                scale_dtype=None,
+                expert_padding=1,
+                nvlink_group=None,
+                recv_buffer_factor=2.0,
+            ),
+            marks=[
+                mark_ci_2gpu,
+                pytest.mark.skipif(not has_tp(2), reason="Requires 2 devices"),
+            ],
+            id="TP2-NIC1-FP32-FACTOR2X",
+        ),
+        pytest.param(
+            _Config(
+                world_size=2,
+                dp_size=1,
+                nets_per_gpu=1,
+                max_num_tokens=8,
+                num_experts=16,
+                hidden_dim=16,
+                hidden_dim_scale=None,
+                max_private_tokens=None,
+                num_experts_per_token=2,
+                in_dtype=torch.bfloat16,
+                out_dtype=torch.bfloat16,
+                scale_dtype=None,
+                expert_padding=16,
+                nvlink_group=None,
+                recv_buffer_factor=1.5,
+            ),
+            marks=[
+                mark_ci_2gpu,
+                pytest.mark.skipif(not has_tp(2), reason="Requires 2 devices"),
+            ],
+            id="TP2-NIC1-BF16-PADDED-FACTOR1.5X",
+        ),
+        pytest.param(
+            _Config(
+                world_size=2,
+                dp_size=1,
+                nets_per_gpu=1,
+                max_num_tokens=32,
+                num_experts=16,
+                hidden_dim=128,
+                hidden_dim_scale=None,
+                num_experts_per_token=2,
+                max_private_tokens=None,
+                in_dtype=torch.float32,
+                out_dtype=torch.float32,
+                scale_dtype=None,
+                expert_padding=1,
+                nvlink_group=None,
+                max_recv_tokens=80,
+            ),
+            marks=[
+                mark_ci_2gpu,
+                pytest.mark.skipif(not has_tp(2), reason="Requires 2 devices"),
+            ],
+            id="TP2-NIC1-FP32-OVERRIDE80",
         ),
     ],
 )
