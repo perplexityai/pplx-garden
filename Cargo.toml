@@ -12,6 +12,7 @@ members = [
   "rust/thread-lib",
   "rust/torch-lib",
 ]
+exclude = ["lily"]
 resolver = "2"
 
 [workspace.dependencies]

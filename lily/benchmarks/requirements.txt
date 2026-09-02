@@ -1,0 +1,3 @@
+mlx==0.31.2
+mlx-lm==0.31.3
+transformers==5.14.1

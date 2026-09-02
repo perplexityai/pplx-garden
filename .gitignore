@@ -1,4 +1,5 @@
 .vscode
+.clangd
 .DS_Store
 data
 

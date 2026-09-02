@@ -1,0 +1,13 @@
+/target
+Cargo.lock.bak
+
+# Local Python virtualenvs and bytecode.
+tools/.venv/
+.venv/
+__pycache__/
+
+# Benchmark and profiling output.
+bench-results/
+*.gputrace
+
+.DS_Store

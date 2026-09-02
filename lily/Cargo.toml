@@ -1,0 +1,57 @@
+[package]
+name = "lily"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0"
+description = "A Metal LLM inference engine for Apple Silicon"
+repository = "https://github.com/perplexityai/pplx-garden"
+readme = "README.md"
+keywords = ["llm", "inference", "metal", "apple-silicon", "gpu"]
+categories = ["science"]
+exclude = ["tools/"]
+
+[lib]
+name = "lily"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lily"
+path = "src/main.rs"
+
+[[bin]]
+name = "lily-bench"
+path = "src/bin/lily-bench.rs"
+
+[dependencies]
+anyhow = { version = "1.0.102", features = ["backtrace"] }
+bytemuck = { version = "1.25.0", features = ["extern_crate_alloc"] }
+clap = { version = "4.5.7", features = ["derive"] }
+half = { version = "2.7.1", features = ["bytemuck"] }
+# Renders the checkpoint's own chat template. `json` supplies `tojson`, which
+# Qwen's template references even though the API does not expose tools.
+minijinja = { version = "2.5", features = ["loader", "json"] }
+# `pycompat` supplies the Python string methods (`startswith`, `split`, ...)
+# that Hugging Face chat templates use and that minijinja does not implement
+# natively. Without it the Qwen template dies on `content.startswith(...)`.
+minijinja-contrib = { version = "2.5", features = ["pycompat"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+tiny_http = "0.12"
+
+# Metal and the Objective-C runtime. The engine is macOS-only; `lib.rs` gates
+# every GPU module on `target_os = "macos"` so the crate still type-checks
+# elsewhere.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = "0.3.2"
+objc2-metal = "0.3.2"
+
+[dev-dependencies]
+rand = { version = "0.8.5", features = ["small_rng"] }
+
+[profile.release]
+# The kernels are the product; let LLVM see across module boundaries.
+lto = "thin"
+codegen-units = 1

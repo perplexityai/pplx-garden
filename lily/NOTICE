@@ -1,0 +1,30 @@
+lily
+Copyright 2026 Perplexity AI, Inc.
+
+This product includes software developed as part of the lily project,
+licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------------
+Third-party attribution
+--------------------------------------------------------------------------------
+
+MLX and mlx-lm (https://github.com/ml-explore/mlx, MIT License)
+
+  lily reads MLX's affine 4-bit weight format ({codes, scales, biases}, group-
+  wise), and several of its Metal kernels follow constructions from MLX's
+  shaders:
+
+    src/kernels/metal/quant.metal   the affine 4-bit dequantization contract
+    src/kernels/metal/moe.metal     the sparse-MoE routing semantics, and the
+                                    dequant factoring of the quantized GEMV
+    src/kernels/metal/gdn.metal     the gated delta step
+
+  The kernels are lily's own implementations for its own tile geometry; the
+  algorithmic constructions and the on-disk format are MLX's.
+
+--------------------------------------------------------------------------------
+
+The Gated DeltaNet recurrence that tests/support/cpu_ref.rs and
+src/kernels/gdn.rs implement, and the online-softmax formulation the
+flash-attention prefill kernel uses, are published algorithms; the
+implementations here are lily's.
