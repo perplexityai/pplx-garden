@@ -42,3 +42,39 @@ fn api_errors_separate_client_and_server_failures() {
     assert_eq!(internal.kind(), "server_error");
     assert_eq!(internal.public_message(), "internal server error");
 }
+
+#[test]
+fn request_log_line_reports_tokens_and_rate() {
+    let usage = Usage {
+        prompt_tokens: 27,
+        completion_tokens: 160,
+        total_tokens: 187,
+        prompt_tokens_details: PromptTokensDetails { cached_tokens: 5 },
+    };
+    let line = request_log_line(
+        "POST",
+        "/v1/chat/completions",
+        200,
+        Duration::from_millis(5560),
+        Some(TokenCounts::from(usage)),
+        None,
+    );
+    assert_eq!(
+        line,
+        "POST /v1/chat/completions 200 5560ms prompt=27 cached=5 completion=160 \
+         tok/s=28.8"
+    );
+}
+
+#[test]
+fn request_log_line_reports_errors_without_usage() {
+    let line = request_log_line(
+        "POST",
+        "/v1/chat/completions",
+        400,
+        Duration::from_millis(3),
+        None,
+        Some("bad request"),
+    );
+    assert_eq!(line, "POST /v1/chat/completions 400 3ms error=\"bad request\"");
+}

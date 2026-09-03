@@ -39,6 +39,8 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 tiny_http = "0.12"
+ratatui = "0.30"
+crossterm = "0.29"
 
 # Metal and the Objective-C runtime. The engine is macOS-only; `lib.rs` gates
 # every GPU module on `target_os = "macos"` so the crate still type-checks

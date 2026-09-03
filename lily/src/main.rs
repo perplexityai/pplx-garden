@@ -19,9 +19,13 @@ struct Cli {
     /// Maximum prompt plus completion length.
     #[arg(long, default_value_t = 4096)]
     max_seq: usize,
+
+    /// Show a live dashboard in the terminal instead of per-request log lines.
+    #[arg(long)]
+    tui: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    lily::serve::run(&cli.model, &cli.bind, cli.max_seq)
+    lily::serve::run(&cli.model, &cli.bind, cli.max_seq, cli.tui)
 }
