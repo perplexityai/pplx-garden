@@ -162,6 +162,18 @@ impl MetalContext {
 
     /// Allocates a zero-initialized shared-storage buffer.
     pub fn new_buffer(&self, len: usize) -> Result<Buffer> {
+        let buf = self.new_uninitialized_buffer(len)?;
+        // Metal does not guarantee new buffer contents; callers rely on zeros.
+        unsafe { core::ptr::write_bytes(buf.contents().as_ptr().cast::<u8>(), 0, len) };
+        Ok(buf)
+    }
+
+    /// Allocates a shared-storage buffer without touching its contents.
+    ///
+    /// Keeping this separate from [`Self::new_buffer`] makes the unusual
+    /// write-before-read contract explicit at the call site. On Apple silicon,
+    /// untouched shared-buffer pages can remain physically uncommitted.
+    pub(crate) fn new_uninitialized_buffer(&self, len: usize) -> Result<Buffer> {
         let buf = self
             .device
             .newBufferWithLength_options(
@@ -169,8 +181,6 @@ impl MetalContext {
                 MTLResourceOptions::StorageModeShared,
             )
             .ok_or_else(|| anyhow!("failed to allocate {len}-byte buffer"))?;
-        // Metal does not guarantee new buffer contents; callers rely on zeros.
-        unsafe { core::ptr::write_bytes(buf.contents().as_ptr().cast::<u8>(), 0, len) };
         Ok(buf)
     }
 

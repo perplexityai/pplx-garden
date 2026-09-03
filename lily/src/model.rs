@@ -539,7 +539,11 @@ impl Qwen3_5Model {
                     ],
                 }),
                 LayerWeights::Full(_) => Ok(LayerState::Full {
-                    k_cache: Tensor::zeros(
+                    // Attention only reads positions through `pos`; prefill and
+                    // decode scatter K/V into each position before including it
+                    // in that bound. Avoid touching the unused capacity so its
+                    // shared-buffer pages can remain physically uncommitted.
+                    k_cache: Tensor::uninitialized(
                         ctx,
                         &[
                             self.config.num_key_value_heads,
@@ -548,7 +552,7 @@ impl Qwen3_5Model {
                         ],
                         DType::BF16,
                     )?,
-                    v_cache: Tensor::zeros(
+                    v_cache: Tensor::uninitialized(
                         ctx,
                         &[
                             self.config.num_key_value_heads,
