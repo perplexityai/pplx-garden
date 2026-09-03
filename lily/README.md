@@ -14,7 +14,9 @@ build step.
 
 ## Requirements
 
-- Apple GPU family 10 or later (M5 and newer)
+- Apple GPU family 9 or later (M3 and newer). Family 10 (M5 and newer) runs the
+  tensor-op kernels on native tensor units; family 9 (M3/M4) runs them through
+  emulation, which is correct but slower
 - macOS 26 or later for Metal tensor operations
 - Rust 1.92, pinned by `rust-toolchain.toml`
 - A local Qwen3.6-35B-A3B MLX affine 4-bit checkpoint with group size 64

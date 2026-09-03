@@ -88,13 +88,22 @@ impl MetalContext {
             .newCommandQueue()
             .ok_or_else(|| anyhow!("failed to create command queue"))?;
         let ctx = Self { device, queue, pipelines: Mutex::new(HashMap::new()) };
-        // The production GEMM paths use native Metal tensor units.
+        // The production GEMM paths use Metal-4 tensor ops. Family 10 (M5 and
+        // later) runs them on native tensor units; family 9 (M3/M4) runs them
+        // through MPP emulation, which is correct but slower.
         let family = ctx.apple_gpu_family();
         ensure!(
-            family >= 10,
-            "lily needs an Apple GPU with native tensor units (family 10, M5 and \
-             later); this device reports family {family}"
+            family >= 9,
+            "lily needs an Apple GPU of family 9 or later (M3 and newer); this \
+             device reports family {family}"
         );
+        if family < 10 {
+            eprintln!(
+                "note: Apple GPU family {family} has no native tensor units; \
+                 Metal-4 tensor ops run via emulation and performance is not \
+                 representative of M5-class hardware"
+            );
+        }
         Ok(ctx)
     }
 
