@@ -5,7 +5,7 @@ mod session;
 use std::io::Read as _;
 use std::net::ToSocketAddrs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -62,7 +62,7 @@ struct Choice {
     finish_reason: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Copy)]
 struct Usage {
     prompt_tokens: usize,
     completion_tokens: usize,
@@ -70,7 +70,7 @@ struct Usage {
     prompt_tokens_details: PromptTokensDetails,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Copy)]
 struct PromptTokensDetails {
     cached_tokens: usize,
 }
@@ -130,6 +130,7 @@ impl ApiError {
 }
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
+type JsonResponse = Response<std::io::Cursor<Vec<u8>>>;
 
 struct Engine {
     ctx: MetalContext,
@@ -271,24 +272,40 @@ pub fn run(model_dir: &Path, bind: &str, max_seq: usize) -> Result<()> {
     eprintln!("serving {MODEL_ID} on http://{address}");
 
     for mut request in server.incoming_requests() {
+        let started = Instant::now();
+        let method = request.method().as_str().to_string();
+        let path = request.url().to_string();
         let result = dispatch(&mut engine, &mut request);
-        let response = match result {
-            Ok(response) => response,
+        let (response, usage, error) = match result {
+            Ok((response, usage)) => (response, usage, None),
             Err(error) => {
                 if matches!(&error, ApiError::Internal(_)) {
                     eprintln!("request failed: {:#}", error.source());
                 }
-                json_response(
+                let message = error.public_message();
+                let response = json_response(
                     error.status(),
                     &ErrorEnvelope {
                         error: ErrorBody {
-                            message: error.public_message(),
+                            message: message.clone(),
                             kind: error.kind(),
                         },
                     },
-                )?
+                )?;
+                (response, None, Some(message))
             }
         };
+        eprintln!(
+            "{}",
+            request_log_line(
+                &method,
+                &path,
+                response.status_code().0,
+                started.elapsed(),
+                usage.as_ref(),
+                error.as_deref(),
+            )
+        );
         if let Err(error) = request.respond(response) {
             eprintln!("response error: {error}");
         }
@@ -296,14 +313,44 @@ pub fn run(model_dir: &Path, bind: &str, max_seq: usize) -> Result<()> {
     Ok(())
 }
 
+/// One stderr line per request: method, path, status, wall time, and for chat
+/// completions the token counts plus request-level tokens per second (wall
+/// time includes prefill and any queue wait, so this is not a decode rate).
+fn request_log_line(
+    method: &str,
+    path: &str,
+    status: u16,
+    elapsed: Duration,
+    usage: Option<&Usage>,
+    error: Option<&str>,
+) -> String {
+    let mut line = format!("{method} {path} {status} {}ms", elapsed.as_millis());
+    if let Some(usage) = usage {
+        let secs = elapsed.as_secs_f64().max(1e-3);
+        line.push_str(&format!(
+            " prompt={} cached={} completion={} tok/s={:.1}",
+            usage.prompt_tokens,
+            usage.prompt_tokens_details.cached_tokens,
+            usage.completion_tokens,
+            usage.completion_tokens as f64 / secs
+        ));
+    }
+    if let Some(error) = error {
+        line.push_str(&format!(" error={error:?}"));
+    }
+    line
+}
+
+/// Routes one request; chat completions also return their usage for the log.
 fn dispatch(
     engine: &mut Engine,
     request: &mut Request,
-) -> ApiResult<Response<std::io::Cursor<Vec<u8>>>> {
+) -> ApiResult<(JsonResponse, Option<Usage>)> {
     let path = request.url().split('?').next().unwrap_or(request.url());
     match (request.method(), path) {
         (&Method::Get, "/health") => {
             json_response(StatusCode(200), &serde_json::json!({"status": "ok"}))
+                .map(|response| (response, None))
                 .map_err(ApiError::internal)
         }
         (&Method::Get, "/v1/models") => json_response(
@@ -318,6 +365,7 @@ fn dispatch(
                 }]
             }),
         )
+        .map(|response| (response, None))
         .map_err(ApiError::internal),
         (&Method::Post, "/v1/chat/completions") => {
             let mut body = Vec::new();
@@ -336,7 +384,9 @@ fn dispatch(
                 .context("parsing chat request")
                 .map_err(ApiError::invalid)?;
             let response = engine.complete(chat)?;
-            json_response(StatusCode(200), &response).map_err(ApiError::internal)
+            let http = json_response(StatusCode(200), &response)
+                .map_err(ApiError::internal)?;
+            Ok((http, Some(response.usage)))
         }
         _ => json_response(
             StatusCode(404),
@@ -347,14 +397,12 @@ fn dispatch(
                 },
             },
         )
+        .map(|response| (response, None))
         .map_err(ApiError::internal),
     }
 }
 
-fn json_response<T: Serialize>(
-    status: StatusCode,
-    value: &T,
-) -> Result<Response<std::io::Cursor<Vec<u8>>>> {
+fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Result<JsonResponse> {
     let body = serde_json::to_vec(value)?;
     let content_type =
         Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
