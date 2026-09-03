@@ -1,13 +1,17 @@
 //! A deliberately small, serial OpenAI-compatible chat-completions server.
 
 mod session;
+mod stats;
+mod tui;
 
 use std::io::Read as _;
 use std::net::ToSocketAddrs;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
@@ -16,6 +20,7 @@ use crate::generate::{Generator, Thinking};
 use crate::metal::MetalContext;
 use crate::model::{Qwen3_5Model, Scratch};
 use session::SessionStore;
+use stats::{Event, RequestRecord, TokenCounts};
 
 pub const MODEL_ID: &str = "Qwen3.6-35B-A3B";
 const MAX_REQUEST_BYTES: usize = 1 << 20;
@@ -73,6 +78,56 @@ struct Usage {
 #[derive(Serialize, Clone, Copy)]
 struct PromptTokensDetails {
     cached_tokens: usize,
+}
+
+impl From<Usage> for TokenCounts {
+    fn from(usage: Usage) -> Self {
+        Self {
+            prompt: usage.prompt_tokens as u64,
+            cached: usage.prompt_tokens_details.cached_tokens as u64,
+            completion: usage.completion_tokens as u64,
+        }
+    }
+}
+
+/// Where per-request reporting goes: stderr lines, or the TUI thread.
+enum Sink {
+    Stderr,
+    Tui(mpsc::Sender<Event>),
+}
+
+impl Sink {
+    fn started(&self) {
+        if let Sink::Tui(tx) = self {
+            let _ = tx.send(Event::Started);
+        }
+    }
+
+    fn finished(&self, record: RequestRecord) {
+        match self {
+            Sink::Stderr => eprintln!(
+                "{}",
+                request_log_line(
+                    &record.method,
+                    &record.path,
+                    record.status,
+                    record.elapsed,
+                    record.tokens,
+                    record.error.as_deref(),
+                )
+            ),
+            Sink::Tui(tx) => {
+                let _ = tx.send(Event::Finished(record));
+            }
+        }
+    }
+
+    /// Out-of-band diagnostics; suppressed while the TUI owns the terminal.
+    fn note(&self, message: &str) {
+        if let Sink::Stderr = self {
+            eprintln!("{message}");
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -259,28 +314,62 @@ impl Engine {
     }
 }
 
-pub fn run(model_dir: &Path, bind: &str, max_seq: usize) -> Result<()> {
+/// Serves until the listener is unblocked. With `tui` set, a dashboard thread
+/// owns the terminal and per-request log lines go to it instead of stderr.
+pub fn run(model_dir: &Path, bind: &str, max_seq: usize, tui: bool) -> Result<()> {
     let address = bind
         .to_socket_addrs()
         .with_context(|| format!("resolving bind address {bind}"))?
         .next()
         .with_context(|| format!("bind address {bind} resolved to nothing"))?;
-    let server = Server::http(address)
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .with_context(|| format!("binding http://{bind}"))?;
+    let server = Arc::new(
+        Server::http(address)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("binding http://{bind}"))?,
+    );
     let mut engine = Engine::load(model_dir, max_seq)?;
     eprintln!("serving {MODEL_ID} on http://{address}");
 
+    let (sink, dashboard) = if tui {
+        let (tx, rx) = mpsc::channel();
+        let banner = tui::Banner {
+            model: MODEL_ID,
+            address: address.to_string(),
+            max_seq: engine.max_seq,
+            gpu_family: engine.ctx.apple_gpu_family(),
+        };
+        let server = Arc::clone(&server);
+        let handle = std::thread::spawn(move || tui::run(banner, rx, server));
+        (Sink::Tui(tx), Some(handle))
+    } else {
+        (Sink::Stderr, None)
+    };
+
+    let outcome = serve_loop(&server, &mut engine, &sink);
+    // Dropping the sender ends the dashboard; join it so the terminal is
+    // restored before we return, whichever side stopped first.
+    drop(sink);
+    if let Some(handle) = dashboard {
+        match handle.join() {
+            Ok(result) => result?,
+            Err(_) => bail!("dashboard thread panicked"),
+        }
+    }
+    outcome
+}
+
+fn serve_loop(server: &Server, engine: &mut Engine, sink: &Sink) -> Result<()> {
     for mut request in server.incoming_requests() {
         let started = Instant::now();
         let method = request.method().as_str().to_string();
         let path = request.url().to_string();
-        let result = dispatch(&mut engine, &mut request);
-        let (response, usage, error) = match result {
-            Ok((response, usage)) => (response, usage, None),
+        sink.started();
+        let result = dispatch(engine, &mut request);
+        let (response, tokens, error) = match result {
+            Ok((response, usage)) => (response, usage.map(TokenCounts::from), None),
             Err(error) => {
                 if matches!(&error, ApiError::Internal(_)) {
-                    eprintln!("request failed: {:#}", error.source());
+                    sink.note(&format!("request failed: {:#}", error.source()));
                 }
                 let message = error.public_message();
                 let response = json_response(
@@ -295,19 +384,16 @@ pub fn run(model_dir: &Path, bind: &str, max_seq: usize) -> Result<()> {
                 (response, None, Some(message))
             }
         };
-        eprintln!(
-            "{}",
-            request_log_line(
-                &method,
-                &path,
-                response.status_code().0,
-                started.elapsed(),
-                usage.as_ref(),
-                error.as_deref(),
-            )
-        );
+        sink.finished(RequestRecord {
+            method,
+            path,
+            status: response.status_code().0,
+            elapsed: started.elapsed(),
+            tokens,
+            error,
+        });
         if let Err(error) = request.respond(response) {
-            eprintln!("response error: {error}");
+            sink.note(&format!("response error: {error}"));
         }
     }
     Ok(())
@@ -321,18 +407,18 @@ fn request_log_line(
     path: &str,
     status: u16,
     elapsed: Duration,
-    usage: Option<&Usage>,
+    tokens: Option<TokenCounts>,
     error: Option<&str>,
 ) -> String {
     let mut line = format!("{method} {path} {status} {}ms", elapsed.as_millis());
-    if let Some(usage) = usage {
+    if let Some(tokens) = tokens {
         let secs = elapsed.as_secs_f64().max(1e-3);
         line.push_str(&format!(
             " prompt={} cached={} completion={} tok/s={:.1}",
-            usage.prompt_tokens,
-            usage.prompt_tokens_details.cached_tokens,
-            usage.completion_tokens,
-            usage.completion_tokens as f64 / secs
+            tokens.prompt,
+            tokens.cached,
+            tokens.completion,
+            tokens.completion as f64 / secs
         ));
     }
     if let Some(error) = error {

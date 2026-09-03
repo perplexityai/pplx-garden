@@ -56,7 +56,7 @@ fn request_log_line_reports_tokens_and_rate() {
         "/v1/chat/completions",
         200,
         Duration::from_millis(5560),
-        Some(&usage),
+        Some(TokenCounts::from(usage)),
         None,
     );
     assert_eq!(
