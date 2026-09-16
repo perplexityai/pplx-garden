@@ -43,9 +43,18 @@ fn build_all_pipelines(
     Ok(functions.len())
 }
 
+fn print_device_capabilities(ctx: &MetalContext) {
+    println!(
+        "Apple GPU family {}; native tensor acceleration: {}",
+        ctx.apple_gpu_family(),
+        ctx.has_native_tensor_acceleration()
+    );
+}
+
 #[test]
 fn all_shaders_compile_and_all_kernels_build_pipelines() -> Result<()> {
     let ctx = MetalContext::new()?;
+    print_device_capabilities(&ctx);
     for (name, source) in SHADERS {
         // gemm.metal intentionally contains only the MSL 4 tensor-op kernel.
         let count = build_all_pipelines(
@@ -62,10 +71,12 @@ fn all_shaders_compile_and_all_kernels_build_pipelines() -> Result<()> {
 
 /// The `#if __METAL_VERSION__ >= 400` kernels (the neural-accelerator GEMM,
 /// flash SDPA, and blockwise GDN) only exist in the 4.0 compile; cover them
-/// at the production language version.
+/// at the production language version. On Apple GPU families 7-9 this also
+/// verifies that Metal can build the optimized-shader TensorOps path.
 #[test]
 fn shaders_compile_at_msl4() -> Result<()> {
     let ctx = MetalContext::new()?;
+    print_device_capabilities(&ctx);
     for (name, source) in SHADERS {
         let count = build_all_pipelines(&ctx, name, source, MslVersion::V4_0, true)?;
         println!("{name}: {count} kernels OK at MSL 4.0");

@@ -5,7 +5,6 @@ edition = "2024"
 rust-version = "1.92"
 license = "Apache-2.0"
 description = "A Metal LLM inference engine for Apple Silicon"
-repository = "https://github.com/perplexityai/pplx-garden"
 readme = "README.md"
 keywords = ["llm", "inference", "metal", "apple-silicon", "gpu"]
 categories = ["science"]

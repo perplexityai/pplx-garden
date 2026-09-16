@@ -3,6 +3,15 @@ pplx-garden
 
 Perplexity AI open source garden for inference technology
 
+> [!NOTE]
+> Lily in this repository supports **Apple Silicon M1 and newer** on
+> **macOS 26.1+**. Apple GPU families 7-9 (M1-M4) execute Metal 4 TensorOps
+> through optimized GPU shader implementations, while Apple GPU family 10+
+> (M5 and newer) can use the per-GPU-core Neural Accelerators.
+>
+> See [lily/README.md](lily/README.md#apple-silicon-support) for requirements,
+> limitations, validation commands, and performance expectations.
+
 ## Projects
 
 ### fabric-lib
@@ -28,8 +37,12 @@ Unigram tokenizer encoder
 Rust and Metal inference server for Qwen3.6-35B-A3B on Apple Silicon. Lily
 provides greedy text generation through a minimal OpenAI-compatible HTTP API.
 
+This version accepts Apple GPU family 7 and later, covering M1, M2, M3, M4,
+and M5+ systems that meet the macOS and memory requirements.
+
 * Docs: [lily/README.md](lily/README.md)
-* Blog Post: [Optimizing On-Device Inference for Apple Silicon](https://www.perplexity.ai/hub/blog/optimizing-on-device-inference-for-apple-silicon)
+* Upstream Blog Post: [Optimizing On-Device Inference for Apple Silicon](https://www.perplexity.ai/hub/blog/optimizing-on-device-inference-for-apple-silicon)
+* Upstream: [perplexityai/pplx-garden](https://github.com/perplexityai/pplx-garden)
 * License: [Apache-2.0](lily/LICENSE), with third-party notices in [lily/NOTICE](lily/NOTICE)
 
 ## Directory Structure
